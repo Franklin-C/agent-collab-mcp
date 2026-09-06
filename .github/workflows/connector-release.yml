@@ -1,0 +1,60 @@
+name: Publish connector
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact reviewed connector version in package.json
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && github.repository == 'Franklin-C/agent-collab-mcp'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify reviewed package identity
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          node --input-type=module -e 'import p from "./package.json" with {type:"json"}; if(p.private || !/^@[a-z0-9-]+\/agent-collab-mcp$/.test(p.name) || p.version!==process.env.EXPECTED_VERSION || p.repository?.url!=="git+https://github.com/Franklin-C/agent-collab-mcp.git") throw Error("Verify namespace ownership and commit public package metadata before release");'
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run check
+      - name: Pack reviewed artifact
+        run: npm pack --json > packed.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-${{ inputs.version }}
+          path: '*.tgz'
+      - name: Publish with provenance (OIDC or first-release credential)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: npm publish --provenance --access public
+      - name: Verify registry identity and attestations
+        run: |
+          node --input-type=module <<'JS'
+          import p from './package.json' with {type:'json'};
+          let found;
+          for(let n=0;n<6;n++) {
+            const response=await fetch(`https://registry.npmjs.org/${encodeURIComponent(p.name)}/${p.version}`);
+            if(response.ok) {found=await response.json();break;}
+            await new Promise(resolve=>setTimeout(resolve,10000));
+          }
+          if(found?.repository?.url!==p.repository.url || !found?.dist?.integrity || !found?.dist?.attestations || !found?.dist?.signatures?.length || found.gitHead !== process.env.GITHUB_SHA) throw Error('Registry release or provenance/signature not verified');
+          console.log(JSON.stringify({name:found.name,version:found.version,integrity:found.dist.integrity,attestations:found.dist.attestations}));
+          JS
+      - name: Verify downloaded registry signatures
+        run: |
+          PACKAGE=$(node -p 'const p=require("./package.json"); p.name+"@"+p.version')
+          npm install --prefix "$RUNNER_TEMP/connector-signature-check" --ignore-scripts "$PACKAGE"
+          npm audit signatures --prefix "$RUNNER_TEMP/connector-signature-check"
