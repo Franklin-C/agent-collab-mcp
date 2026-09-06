@@ -38,18 +38,62 @@ State lives in a private directory under `~/.agent-collab/supervisor/`: cursor, 
 
 | Client | Real adapter | Local verification | Resume |
 | --- | --- | --- | --- |
-| Codex CLI | `exec --json`, stdin | Installed 0.31.0 launched; configured model rejected this old CLI and an unrelated MCP executable was missing. No successful model turn claimed. | Modern CLI explicit `exec resume ID`; this installed legacy CLI uses fresh turns. |
-| Claude Code | `--print --output-format stream-json` | Installed 2.1.158 launched, emitted session ID; provider returned 401. No successful model turn claimed. | Exact session ID. |
-| Gemini CLI | `--prompt --output-format stream-json` | Installed 0.20.2 launched; account requires GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID. No successful model turn claimed. | Fresh turns: installed resume help does not establish stable UUID support. |
+| Codex CLI | `exec --json`, stdin | Updated 0.31.0 → 0.153.4. Existing ChatGPT login successfully ran bounded `gpt-6-astra` READY turns with structured token usage. A clean invocation removed unrelated plugin/MCP startup. A subsequent bounded live `pointer-hub-supervised` run passed its independent check with no MCP failures and uploaded usage. | Installed 0.153.4 supports explicit `exec resume ID`; full supervisor recovery acceptance is separate. |
+| Claude Code | `--print --output-format stream-json` | Updated 2.1.158 → 2.1.263. Existing provider overrides timed out in a 100-second probe; excluding those overrides and user helper settings reports no stored OAuth login. No successful provider turn claimed. | Exact session ID. |
+| Gemini CLI | `--prompt --output-format stream-json` | Updated 0.20.2 → 0.58.0. Google rejected the configured personal account tier with `UNSUPPORTED_CLIENT` and directed it to Antigravity. No Gemini/Google API key is configured. No successful provider turn claimed. | Fresh turns: adapter does not claim stable UUID resumption. |
 | Cursor / VS Code / Windsurf | MCP configuration | Config preservation and backup contract tests. | Manual GUI wakeup only. |
 
 The contract suite verifies idle silence, durable replay, exact resume, stop cancellation, identity isolation, and safe argument construction. It does not substitute for a successful authenticated provider turn. Interfaces: [Codex](https://learn.chatgpt.com/docs/non-interactive-mode), [Claude](https://code.claude.com/docs/en/headless), [Gemini](https://geminicli.com/docs/cli/headless/).
+
+### Isolated Codex readiness profile (POSIX shells)
+
+For a controlled benchmark, use an invocation wrapper instead of editing the operator's global Codex configuration. The following profile was verified with Codex 0.153.4 and `gpt-6-astra`. It retains the existing ChatGPT login, disables unrelated apps/plugins/hooks and host skill discovery, and exposes only this hub's MCP server. The token remains in `AGENT_COLLAB_TOKEN`, not the process arguments or wrapper file. Set that variable through your existing secure environment setup before starting.
+
+This profile deliberately disables auto-loaded instruction documents for a disposable benchmark checkout that receives explicit task instructions. For ordinary repository work, remove `project_doc_max_bytes=0` so repository instructions remain available. `skip_host_skill_discovery` is currently a Codex development feature; verify it again after client upgrades. Do not use this benchmark configuration as an unreviewed global default.
+
+```sh
+export AGENT_COLLAB_CODEX_BINARY="$(command -v codex)"
+export AGENT_COLLAB_HOST=https://agent-collab--agentcollabeh.us-central1.hosted.app
+profile_dir="$(mktemp -d)"
+cat > "$profile_dir/codex" <<'SH'
+#!/bin/sh
+if [ "$1" = exec ]; then
+  shift
+  exec "$AGENT_COLLAB_CODEX_BINARY" exec \
+    --ignore-user-config --disable plugins --disable apps --disable hooks \
+    --enable skip_host_skill_discovery \
+    -c suppress_unstable_features_warning=true \
+    -c project_doc_max_bytes=0 -c 'model_reasoning_effort="low"' \
+    -c "mcp_servers.agent_collab.url=\"${AGENT_COLLAB_HOST%/}/api/mcp\"" \
+    -c 'mcp_servers.agent_collab.bearer_token_env_var="AGENT_COLLAB_TOKEN"' \
+    -c 'mcp_servers.agent_collab.enabled_tools=["list_tasks","update_task"]' \
+    -c 'mcp_servers.agent_collab.default_tools_approval_mode="prompt"' \
+    -c 'mcp_servers.agent_collab.tools.list_tasks.approval_mode="approve"' \
+    -c 'mcp_servers.agent_collab.tools.update_task.approval_mode="approve"' \
+    -c mcp_servers.agent_collab.startup_timeout_sec=30 \
+    -c mcp_servers.agent_collab.tool_timeout_sec=120 "$@"
+fi
+exec "$AGENT_COLLAB_CODEX_BINARY" "$@"
+SH
+chmod 700 "$profile_dir/codex"
+PATH="$profile_dir:$PATH" agent-collab-mcp supervise \
+  --host "$AGENT_COLLAB_HOST" --client codex --model gpt-6-astra \
+  --cwd /absolute/disposable-checkout
+```
+
+Keep the wrapper directory while the supervisor runs; later remove that directory after stopping it. The adapter still supplies its normal read-only sandbox, or workspace-write only with explicit `--write`. The wrapper passes version/help and exact resume calls through; no global config or provider selection is rewritten. The supervisor's durable state/session remains separate from this disposable wrapper. Programmatic callers can instead pass an equivalent wrapper as `capability.executable` to `supervise()`; there is no invented `--isolated-client-config` flag.
+
+The two-tool allowlist and per-tool `approve` settings are explicit authorization for this disposable benchmark's task reads and updates. The server default stays `prompt`; no other MCP tool is exposed, and local sandbox permissions remain unchanged. An initial live attempt without those overrides failed with “MCP tool call requires approval, but approval policy is never.” After applying this narrow policy, the `pointer-hub-supervised` live run completed in 66.575 seconds, passed its independent check, had no MCP failures and uploaded usage. This verifies one bounded supervised coding run, not every client, recovery scenario or production workload. For other work, review the specific required tools and their authority instead of approving the whole server. See [official Codex tool policy configuration](https://learn.chatgpt.com/docs/extend/mcp).
+
+The READY-only probe reported 19,083 input tokens (11,520 cached) with ambient integrations and 15,000 input tokens (10,496 cached) in the isolated profile; both produced five output tokens. These small probes establish provider access and structured usage, not a representative coding-cost benchmark or successful end-to-end hub supervision. The remaining CLI context is significant and is not claimed to be zero.
+
+Claude needs an operator-controlled login or repaired provider credentials. To explicitly use first-party login while ignoring the failing invocation overrides/helper settings, run `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL claude --setting-sources '' auth login`; do not change a deliberate enterprise/provider configuration without reviewing it. Gemini's provider/account rejection needs an eligible supported authentication setup from the operator; installing a newer CLI did not resolve it, and the connector does not bypass that restriction. Never paste provider credentials into an issue, repository or chat.
 
 ## Registry releases and updates
 
 The authenticated npm identity `franklineh` owns the selected personal scope `@franklineh`; ownership was verified on 2026-09-06. Publication still requires the source and trusted-publisher gates below. `node scripts/prepare-release.mjs @owned-scope` verifies `npm whoami` and personal scope or organization membership, then writes a public staging directory without publishing. Review and commit that verified name, repository metadata and public setting to the source package and lockfile. Never use the unrelated unscoped name.
 
-Configure npm's trusted publisher for `Franklin-C/agent-collab-mcp`, workflow `connector-release.yml`, environment `npm-release`. The repository must be public for npm provenance. For a new package, npm may require the owner to bootstrap it or configure its trusted publisher first. The manually dispatched workflow requires the exact committed version, runs connector tests, retains the tarball, publishes with OIDC provenance, and verifies registry integrity, signatures and attestations. A missing trusted publisher fails the release; it does not silently fall back to a token or claim success. [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/), [provenance](https://docs.npmjs.com/generating-provenance-statements/).
+Configure npm's trusted publisher for `Franklin-C/agent-collab-mcp`, workflow `connector-release.yml`, environment `npm-release`. The repository must be public for npm provenance. For a new package, npm may require the owner to bootstrap it or configure its trusted publisher first. The manually dispatched workflow requires the exact committed version, runs connector tests, retains the tarball, publishes with OIDC provenance, and verifies registry integrity, signatures and attestations. Normal releases use the configured OIDC trusted publisher. The first release has an explicit, operator-configured `NPM_BOOTSTRAP_TOKEN` path; this is not a silent fallback. Without either valid OIDC setup or that deliberately supplied bootstrap credential, publishing fails and success is not claimed. [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/), [provenance](https://docs.npmjs.com/generating-provenance-statements/).
 
 `agent-collab-mcp update-check` checks the exact owned package name and repository identity. Published supervisors check once daily and print an actionable upgrade notice on stderr; they never upgrade while a client is working. Private source installs report `unpublished` and do not advertise an unverified registry package.
 
