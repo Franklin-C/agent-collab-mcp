@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { work } from "./worker.mjs";
+import { enroll } from "./enroll.mjs";
+import { manageStartup } from "./service.mjs";
+import { cleanupLocalWorktrees } from "./cleanup.mjs";
+import { configureCodex } from "./codex-config.mjs";
 // Agent Collab connector CLI. Dependency-free except mcp-remote for `serve`.
 import { execFileSync, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -35,10 +40,15 @@ for (let index = 0; index < rest.length; index += 1) {
 function usage(code = 0) {
   console.log(`agent-collab-mcp
 
-  connect <token> --host <url> [--client claude-code|codex|cursor|gemini-cli|vscode|windsurf] [--print]
+  connect <token> --host <url> [--client claude-code|codex|cursor|gemini-cli|antigravity|grok|muse-code|vscode|windsurf] [--print]
+  startup --state <dir> [--install --repo <repo> --host <url> --client <client> --model <model> --write | --uninstall]
+  enroll --host <url> --client <client> --repo <repo> --write [--model <model>] [--configure] [--start]
+  cleanup --repo <repo> --state <worker-state> [--base main] [--verify-github] [--apply]
+  worker --host <url> --client codex|claude-code|gemini-cli --repo <approved-repo> --write [--model <model>] [--once]
   supervise --host <url> --client codex|claude-code|gemini-cli [--cwd <repo>] [--write] [--retry-failed]
   watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once]
-  doctor --host <url> [--client <name>] check connection/config (reads AGENT_COLLAB_TOKEN)
+  doctor --host <url> [--client <name>] [--report] check connection/config (reads AGENT_COLLAB_TOKEN;
+           --report tells the hub how far this machine got, for the Connect panel)
   update-check                  check this owned package for a newer release
   serve --host <url>            stdio bridge (reads AGENT_COLLAB_TOKEN)
   env <token>                   print how to set AGENT_COLLAB_TOKEN on this OS
@@ -76,12 +86,24 @@ function safeWrite(path, content, backup = true) {
 }
 function writeJson(path, value) { safeWrite(path, `${JSON.stringify(value, null, 2)}\n`); }
 
+// The health endpoint takes no credentials, so it separates a blocked network
+// path from a bad token. Probe it before asking for one: an agent behind an
+// egress allowlist has no token problem to fix, and its client is likely
+// reporting the refused connection as an authorization error.
+const BLOCKED = (base, detail) =>
+  new Error(`Cannot reach ${base}: ${detail}. This endpoint needs no token, so the host is blocked, not the credential — an egress allowlist, proxy or firewall answered instead of the hub. Allowlist the host on port 443 (sandboxes fix the policy when the container is created, so start a fresh session afterwards) or run from a machine with direct access. Do not rotate the token, disable TLS verification or route around the proxy.`);
+
 async function doctor() {
   const base = host();
+  let health;
+  try {
+    health = await fetch(`${base}/api/mcp/health`, { signal: AbortSignal.timeout(15000) });
+  } catch (error) {
+    throw BLOCKED(base, error.name === "TimeoutError" ? "the request timed out" : `the connection failed (${error.message})`);
+  }
+  if (!health.ok) throw BLOCKED(base, `the health endpoint returned ${health.status}`);
   const token = process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error("Set AGENT_COLLAB_TOKEN before running doctor.");
-  const health = await fetch(`${base}/api/mcp/health`, { signal: AbortSignal.timeout(15000) });
-  if (!health.ok) throw new Error(`Health endpoint returned ${health.status}.`);
   const response = await fetch(`${base}/api/mcp`, {
     method: "POST", signal: AbortSignal.timeout(15000),
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: `Bearer ${token}` },
@@ -112,7 +134,7 @@ async function doctor() {
   if (executable) { try { execFileSync(executable, ["--version"], { stdio: "ignore" }); executableAvailable = true; } catch { executableAvailable = false; } }
   let configuration = flags.client ? "managed_by_client" : "not_requested";
   let configPath = null;
-  const jsonPaths = { cursor: [join(homedir(), ".cursor", "mcp.json"), "mcpServers"], "gemini-cli": [join(homedir(), ".gemini", "settings.json"), "mcpServers"], windsurf: [join(homedir(), ".codeium", "windsurf", "mcp_config.json"), "mcpServers"], vscode: [join(process.cwd(), ".vscode", "mcp.json"), "servers"] };
+  const jsonPaths = { cursor: [join(homedir(), ".cursor", "mcp.json"), "mcpServers"], "gemini-cli": [join(homedir(), ".gemini", "settings.json"), "mcpServers"], antigravity: [join(homedir(), ".gemini", "config", "mcp_config.json"), "mcpServers"], "muse-code": [join(homedir(), ".config", "muse", "settings.json"), "mcp_servers"], windsurf: [join(homedir(), ".codeium", "windsurf", "mcp_config.json"), "mcpServers"], vscode: [join(process.cwd(), ".vscode", "mcp.json"), "servers"] };
   if (jsonPaths[flags.client]) {
     const [path, key] = jsonPaths[flags.client]; configPath = path;
     const entry = readJson(path)[key]?.["agent-collab"];
@@ -133,8 +155,27 @@ async function doctor() {
     };
     if (!entries.some(([, entry]) => matchesValue(entry, "url", `${base}/api/mcp`) && matchesValue(entry, "bearer_token_env_var", "AGENT_COLLAB_TOKEN"))) throw new Error(`Agent Collab configuration in ${configPath} is missing or differs. Run connect first.`);
     configuration = "verified";
+  } else if (flags.client === "grok") {
+    configPath = join(homedir(), ".grok", "config.toml");
+    const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+    const entry = config.split("[mcp_servers.agent_collab]")[1]?.split(/\n\[/)[0] ?? "";
+    if (!entry.includes(`url = ${JSON.stringify(`${base}/api/mcp`)}`) || !entry.includes("${AGENT_COLLAB_TOKEN}")) throw new Error(`Agent Collab configuration in ${configPath} is missing or differs. Run connect first.`);
+    configuration = "verified";
   }
   console.log(JSON.stringify({ health: "reachable", authentication: "accepted", transport: "streamable-http", protocol: data.result.protocolVersion, tools: listed.result.tools.length, executable, executableAvailable, configuration, configPath, ready: executableAvailable !== false }));
+  // --report tells the hub how far this machine got, so the operator's Connect
+  // panel can name the blocking step instead of waiting indefinitely. Only the
+  // rungs this call cannot prove by itself are sent; reaching here already
+  // proves the host is reachable and the token is accepted. Reporting is
+  // best-effort and never fails the doctor run.
+  if (flags.report) {
+    const reported = await fetch(`${base}/api/agent/readiness`, {
+      method: "POST", signal: AbortSignal.timeout(15000),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ tools: listed.result.tools.length, executable: executableAvailable ?? null }),
+    }).then((response) => response.ok, () => false);
+    if (!reported) console.error("Readiness report was not accepted; the doctor result above still stands.");
+  }
   if (executableAvailable === false) process.exitCode = 1;
 }
 
@@ -230,13 +271,9 @@ function connect() {
       mkdirSync(dirname(path), { recursive: true });
       const current = existsSync(path) ? readFileSync(path, "utf8") : "";
 
-      if (current.includes("[mcp_servers.agent_collab]")) {
-        const existing = current.split("[mcp_servers.agent_collab]")[1].split(/\n\[/)[0];
-        if (!existing.includes(`url = ${JSON.stringify(url)}`) || !existing.includes('bearer_token_env_var = "AGENT_COLLAB_TOKEN"')) throw new Error(`Existing agent_collab config in ${path} differs. Resolve it before reconnecting; file was not changed.`);
-        console.log(`${path}: matching configuration already present.`);
-      } else {
-        safeWrite(path, current + block);
-      }
+      const configured = configureCodex(current, url);
+      if (configured !== current) safeWrite(path, configured);
+      else console.log(`${path}: matching configuration already present.`);
 
       console.log("Codex reads the token from AGENT_COLLAB_TOKEN. Set it before starting codex.");
       break;
@@ -254,6 +291,54 @@ function connect() {
       const path = join(home, ".gemini", "settings.json");
       const config = readJson(path);
       config.mcpServers = { ...(config.mcpServers ?? {}), "agent-collab": { httpUrl: url, headers: { Authorization: `Bearer ${token}` }, timeout: 600000 } };
+      print ? console.log(JSON.stringify(config, null, 2)) : writeJson(path, config);
+      break;
+    }
+
+    // https://antigravity.google/docs/mcp/ - one file for the IDE, the agy CLI and the SDK.
+    // Remote servers must use serverUrl; url and httpUrl are rejected.
+    case "antigravity": {
+      const path = join(home, ".gemini", "config", "mcp_config.json");
+      const config = readJson(path);
+      config.mcpServers = { ...(config.mcpServers ?? {}), "agent-collab": { serverUrl: url, headers: { Authorization: `Bearer ${token}` } } };
+      print ? console.log(JSON.stringify(config, null, 2)) : writeJson(path, config);
+      break;
+    }
+
+    // https://docs.x.ai/build/features/mcp-servers - ${VAR} expands at load time,
+    // so the token stays in the environment rather than in config.toml.
+    case "grok": {
+      const path = join(home, ".grok", "config.toml");
+      const block = `\n[mcp_servers.agent_collab]\nurl = ${JSON.stringify(url)}\nheaders = { "Authorization" = "Bearer \${AGENT_COLLAB_TOKEN}" }\n`;
+
+      if (print) {
+        console.log(block);
+        break;
+      }
+
+      mkdirSync(dirname(path), { recursive: true });
+      const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+
+      if (current.includes("[mcp_servers.agent_collab]")) {
+        const existing = current.split("[mcp_servers.agent_collab]")[1].split(/\n\[/)[0];
+        if (!existing.includes(`url = ${JSON.stringify(url)}`) || !existing.includes("${AGENT_COLLAB_TOKEN}")) throw new Error(`Existing agent_collab config in ${path} differs. Resolve it before reconnecting; file was not changed.`);
+        console.log(`${path}: matching configuration already present.`);
+      } else {
+        safeWrite(path, current + block);
+      }
+
+      console.log("Grok Build expands ${AGENT_COLLAB_TOKEN} at load time. Set it before starting grok.");
+      break;
+    }
+
+    // https://dev.meta.ai/docs/muse-code/extending - mcp_servers block in the settings
+    // file; streamable_http takes url and headers. schema_version 1 is mandatory.
+    case "muse-code": {
+      const path = join(home, ".config", "muse", "settings.json");
+      const config = readJson(path);
+      if (config.schema_version !== undefined && config.schema_version !== 1) throw new Error(`${path} declares schema_version ${JSON.stringify(config.schema_version)}, which this connector does not know how to edit; file was not changed.`);
+      config.schema_version = 1;
+      config.mcp_servers = { ...(config.mcp_servers ?? {}), "agent-collab": { transport: "streamable_http", url, headers: { Authorization: `Bearer ${token}` }, enabled: true, mode: "required" } };
       print ? console.log(JSON.stringify(config, null, 2)) : writeJson(path, config);
       break;
     }
@@ -314,11 +399,28 @@ switch (command) {
   case "update-check":
     console.log(JSON.stringify(await checkUpdate({ force: true })));
     break;
+  case "startup":
+    console.log(JSON.stringify(await manageStartup({ action: flags.install === "true" ? "install" : flags.uninstall === "true" ? "uninstall" : "status", install: flags.install === "true", uninstall: flags.uninstall === "true", write: flags.write === "true", repo: flags.repo, state: flags.state, host: flags.host, client: flags.client, model: flags.model, executable: flags.executable }), null, 2));
+    break;
+  case "cleanup":
+    console.log(JSON.stringify(cleanupLocalWorktrees({ repo: flags.repo, state: flags.state, base: flags.base, apply: flags.apply === "true", verifyGitHub: flags["verify-github"] === "true" }), null, 2));
+    break;
+  case "enroll": {
+    if (flags.configure === "true") connect();
+    const options = { host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model };
+    const result = await enroll(options);
+    console.log(JSON.stringify(result));
+    if (flags.start === "true") await work({ ...options, state: result.state });
+    break;
+  }
+  case "worker":
+    await work({ host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, once: flags.once === "true" });
+    break;
   case "supervise":
     await checkUpdate();
     if (flags.task && (!flags.lease || !Number.isSafeInteger(Number(flags.lease)))) throw new Error("--task requires an integer --lease version.");
     if (flags.phase && !["coordination", "implementation", "review"].includes(flags.phase)) throw new Error("--phase must be coordination, implementation, or review.");
-    await supervise({ phase: flags.phase, host: host(), client: flags.client, cwd: flags.cwd, state: flags.state, write: flags.write === "true", retryFailed: flags["retry-failed"] === "true", task: flags.task, lease: flags.lease, model: flags.model, once: flags.once === "true" });
+    await supervise({ phase: flags.phase, host: host(), client: flags.client, cwd: flags.cwd, state: flags.state, write: flags.write === "true", retryFailed: flags["retry-failed"] === "true", resume: flags.resume === "true", task: flags.task, lease: flags.lease, model: flags.model, once: flags.once === "true" });
     break;
   case "watch":
     await watch();
