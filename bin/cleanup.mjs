@@ -53,6 +53,10 @@ export function cleanupLocalWorktrees(options) {
         const path = realpathSync(tree.worktree);
         if (!inside(worktreesRoot, path) || path === repo || !inside(state, path)) reasons.push('outside_managed_worktrees');
         if (realpathSync(resolve(path, command('git', ['rev-parse', '--git-common-dir'], path))) !== commonDir) reasons.push('different_repository');
+        // Both status and non-force worktree removal trust these index flags.
+        // Inspect without clearing them: skipped or assumed-clean files can
+        // contain edits that Git would otherwise silently delete with the tree.
+        if (command('git', ['ls-files', '-v', '-z'], path).split('\0').some(record => /^[a-zS] /.test(record))) reasons.push('index_flags_hide_worktree_changes');
         if (command('git', ['status', '--porcelain', '--untracked-files=all', '--ignored'], path)) reasons.push('uncommitted_untracked_or_ignored_files');
       }
     }

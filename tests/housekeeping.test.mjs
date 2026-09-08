@@ -32,11 +32,16 @@ test('automatic cleanup removes an acknowledged inactive worktree while retainin
   assert.match(readFileSync(join(f.directory, 'cleanup-audit.jsonl'), 'utf8'), /"state":"deleted"/);
 });
 
-for (const kind of ['untracked', 'ignored', 'tracked', 'unpublished', 'active']) test(`automatic cleanup preserves ${kind} work`, async t => {
+for (const kind of ['untracked', 'ignored', 'tracked', 'unpublished', 'active', 'assume-unchanged', 'skip-worktree']) test(`automatic cleanup preserves ${kind} work`, async t => {
   const f = fixture(t);
   if (kind === 'untracked') writeFileSync(join(f.tree, 'untracked.txt'), 'retain');
   if (kind === 'ignored') writeFileSync(join(f.tree, '.env'), 'retain');
   if (kind === 'tracked') writeFileSync(join(f.tree, 'readme'), 'changed');
+  if (kind === 'assume-unchanged' || kind === 'skip-worktree') {
+    git(f.tree, ['update-index', `--${kind}`, 'readme']);
+    writeFileSync(join(f.tree, 'readme'), 'hidden work');
+    assert.equal(git(f.tree, ['status', '--porcelain']).trim(), '');
+  }
   if (kind === 'unpublished') { writeFileSync(join(f.tree, 'readme'), 'unpublished'); git(f.tree, ['add', '.']); git(f.tree, ['commit', '-m', 'unpublished']); }
   if (kind === 'active') f.state.active = { branch: 'workforce/job-1' };
   // Missing provider proof in the unpublished case fails closed, without any
