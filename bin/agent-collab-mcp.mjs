@@ -123,8 +123,15 @@ async function doctor() {
   } else if (flags.client === "codex") {
     configPath = join(homedir(), ".codex", "config.toml");
     const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-    const entry = config.split("[mcp_servers.agent_collab]")[1]?.split(/\n\[/)[0] ?? "";
-    if (!entry.includes(`url = ${JSON.stringify(`${base}/api/mcp`)}`) || !entry.includes('bearer_token_env_var = "AGENT_COLLAB_TOKEN"')) throw new Error(`Agent Collab configuration in ${configPath} is missing or differs. Run connect first.`);
+    // The Codex CLI uses the supplied name verbatim; older connector installs
+    // used an underscore. Inspect either table without rewriting user settings.
+    const entries = [...config.matchAll(/^[ \t]*\[mcp_servers\.(?:agent[-_]collab|"agent[-_]collab"|'agent[-_]collab')\][ \t]*(?:#[^\r\n]*)?\r?\n([\s\S]*?)(?=^[ \t]*\[|$(?![\s\S]))/gm)];
+    const matchesValue = (entry, key, expected) => {
+      const value = entry.match(new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*("(?:[^"\\\\]|\\\\.)*"|'[^']*')[ \\t]*(?:#[^\\r\\n]*)?\\r?$`, "m"))?.[1];
+      if (!value) return false;
+      try { return (value.startsWith('"') ? JSON.parse(value) : value.slice(1, -1)) === expected; } catch { return false; }
+    };
+    if (!entries.some(([, entry]) => matchesValue(entry, "url", `${base}/api/mcp`) && matchesValue(entry, "bearer_token_env_var", "AGENT_COLLAB_TOKEN"))) throw new Error(`Agent Collab configuration in ${configPath} is missing or differs. Run connect first.`);
     configuration = "verified";
   }
   console.log(JSON.stringify({ health: "reachable", authentication: "accepted", transport: "streamable-http", protocol: data.result.protocolVersion, tools: listed.result.tools.length, executable, executableAvailable, configuration, configPath, ready: executableAvailable !== false }));
