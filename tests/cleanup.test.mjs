@@ -1,0 +1,45 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { cleanupLocalWorktrees } from '../bin/cleanup.mjs';
+
+function fixture(t) {
+  const root = mkdtempSync(join(tmpdir(), 'ehgi-cleanup-')), repo = join(root, 'repo'), state = join(root, 'worker');
+  mkdirSync(repo); mkdirSync(join(state, 'worktrees'), { recursive: true });
+  const git = args => execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  git(['init', '-b', 'main']); git(['config', 'user.email', 'test@example.test']); git(['config', 'user.name', 'Test']);
+  writeFileSync(join(repo, 'readme'), 'base'); git(['add', '.']); git(['commit', '-m', 'base']);
+  const tree = join(state, 'worktrees', 'task-1'); git(['worktree', 'add', '-b', 'workforce/task-1', tree]);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return { repo, state, tree, git };
+}
+test('dry run reports eligible branch without changing files or references', t => {
+  const f = fixture(t), result = cleanupLocalWorktrees(f);
+  assert.equal(result.branches[0].state, 'eligible'); assert.equal(result.dryRun, true);
+  assert.ok(existsSync(f.tree)); assert.ok(f.git(['rev-parse', 'workforce/task-1'])); assert.equal(existsSync(join(f.state, 'cleanup-audit.jsonl')), false);
+});
+test('apply removes a clean merged managed worktree and branch, keeping main and audit', t => {
+  const f = fixture(t), result = cleanupLocalWorktrees({ ...f, apply: true });
+  assert.equal(result.branches[0].state, 'deleted'); assert.equal(existsSync(f.tree), false);
+  assert.equal(f.git(['branch', '--format=%(refname:short)']), 'main'); assert.ok(existsSync(join(f.state, 'cleanup-audit.jsonl')));
+});
+test('preserves untracked and ignored files', t => {
+  const f = fixture(t); writeFileSync(join(f.tree, '.env'), 'local-secret');
+  assert.ok(cleanupLocalWorktrees({ ...f, apply: true }).branches[0].reasons.includes('uncommitted_untracked_or_ignored_files')); assert.ok(existsSync(f.tree));
+});
+test('worker lock prevents cleanup even for fully merged work', t => {
+  const f = fixture(t); writeFileSync(join(f.state, 'worker.lock'), '123');
+  assert.ok(cleanupLocalWorktrees({ ...f, apply: true }).branches[0].reasons.includes('worker_lock_present')); assert.ok(existsSync(f.tree));
+});
+test('preserves unpublished commits with no age-based exceptions', t => {
+  const f = fixture(t); writeFileSync(join(f.tree, 'new'), 'unpublished');
+  execFileSync('git', ['add', '.'], { cwd: f.tree, windowsHide: true }); execFileSync('git', ['commit', '-m', 'unpublished'], { cwd: f.tree, windowsHide: true });
+  assert.ok(cleanupLocalWorktrees({ ...f, apply: true }).branches[0].reasons.includes('merge_not_verified')); assert.ok(existsSync(f.tree));
+});
+test('never removes a worktree outside the explicitly selected worker directory', t => {
+  const f = fixture(t), other = join(f.repo, 'other-worker'); mkdirSync(join(other, 'worktrees'), { recursive: true });
+  assert.ok(cleanupLocalWorktrees({ repo: f.repo, state: other, apply: true }).branches[0].reasons.includes('outside_managed_worktrees')); assert.ok(existsSync(f.tree));
+});

@@ -1,7 +1,7 @@
 {
   "name": "@franklineh/agent-collab-mcp",
-  "version": "0.2.0",
-  "description": "Connect a coding agent to an Agent Collab project: writes MCP config for Claude Code, Codex, Cursor, Gemini CLI, VS Code and Windsurf, or bridges stdio-only clients to the remote MCP endpoint.",
+  "version": "0.3.0",
+  "description": "Connect a coding agent to an Agent Collab project: writes MCP config for Claude Code, Codex, Cursor, Gemini CLI, Google Antigravity, Grok Build, Muse Code, VS Code and Windsurf, or bridges stdio-only clients to the remote MCP endpoint.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -18,7 +18,7 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check bin/agent-collab-mcp.mjs && node --check bin/client-adapters.mjs && node --check bin/supervisor.mjs && node --check bin/usage.mjs && node --check bin/update-check.mjs"
+    "check": "node scripts/check.mjs"
   },
   "private": false,
   "overrides": {

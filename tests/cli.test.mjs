@@ -11,7 +11,7 @@ function fixture(run) {
   try { run(home, (args) => spawnSync(process.execPath, [cli, ...args], { cwd: home, env: { ...process.env, HOME: home, USERPROFILE: home, AGENT_COLLAB_TOKEN: 'test-token' }, encoding: 'utf8' })); }
   finally { rmSync(home, { recursive: true, force: true }); }
 }
-for (const [client, path, key] of [['cursor', '.cursor/mcp.json', 'mcpServers'], ['gemini-cli', '.gemini/settings.json', 'mcpServers'], ['windsurf', '.codeium/windsurf/mcp_config.json', 'mcpServers'], ['vscode', '.vscode/mcp.json', 'servers']]) {
+for (const [client, path, key] of [['cursor', '.cursor/mcp.json', 'mcpServers'], ['gemini-cli', '.gemini/settings.json', 'mcpServers'], ['antigravity', '.gemini/config/mcp_config.json', 'mcpServers'], ['muse-code', '.config/muse/settings.json', 'mcp_servers'], ['windsurf', '.codeium/windsurf/mcp_config.json', 'mcpServers'], ['vscode', '.vscode/mcp.json', 'servers']]) {
   test(`${client}: preserves existing configuration and backs up before writing`, () => fixture((home, run) => {
     const file = join(home, path); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify({ existing: true, [key]: { unrelated: { url: 'https://example.org' } } }));
     assert.equal(run(['connect', '--host', 'https://example.com', '--client', client]).status, 0);
@@ -20,6 +20,33 @@ for (const [client, path, key] of [['cursor', '.cursor/mcp.json', 'mcpServers'],
     assert.ok(readdirSync(dirname(file)).some((name) => name.includes('.backup-')));
   }));
 }
+test('antigravity writes serverUrl, never url or httpUrl', () => fixture((home, run) => {
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'antigravity']).status, 0);
+  const entry = JSON.parse(readFileSync(join(home, '.gemini/config/mcp_config.json'), 'utf8')).mcpServers['agent-collab'];
+  assert.equal(entry.serverUrl, 'https://example.com/api/mcp');
+  assert.equal(entry.url, undefined); assert.equal(entry.httpUrl, undefined);
+  assert.equal(entry.headers.Authorization, 'Bearer test-token');
+}));
+test('muse-code writes a streamable_http server and keeps schema_version 1', () => fixture((home, run) => {
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'muse-code']).status, 0);
+  const value = JSON.parse(readFileSync(join(home, '.config/muse/settings.json'), 'utf8'));
+  assert.equal(value.schema_version, 1);
+  assert.deepEqual(value.mcp_servers['agent-collab'], { transport: 'streamable_http', url: 'https://example.com/api/mcp', headers: { Authorization: 'Bearer test-token' }, enabled: true, mode: 'required' });
+}));
+test('muse-code refuses an unknown settings schema version', () => fixture((home, run) => {
+  const file = join(home, '.config/muse/settings.json'); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify({ schema_version: 99 }));
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'muse-code']).status, 1);
+  assert.equal(readFileSync(file, 'utf8'), JSON.stringify({ schema_version: 99 }));
+}));
+test('grok keeps the token in the environment and rejects a different existing host', () => fixture((home, run) => {
+  const args = ['connect', '--host', 'https://example.com', '--client', 'grok'];
+  assert.equal(run(args).status, 0); assert.equal(run(args).status, 0);
+  const config = readFileSync(join(home, '.grok/config.toml'), 'utf8');
+  assert.match(config, /\[mcp_servers\.agent_collab\]/);
+  assert.match(config, /headers = \{ "Authorization" = "Bearer \$\{AGENT_COLLAB_TOKEN\}" \}/);
+  assert.ok(!config.includes('test-token'));
+  assert.equal(run(['connect', '--host', 'https://another.example', '--client', 'grok']).status, 1);
+}));
 test('malformed JSON remains untouched', () => fixture((home, run) => {
   const file = join(home, '.cursor/mcp.json'); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, '{bad');
   assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'cursor']).status, 1);
@@ -33,6 +60,35 @@ test('Codex rejects a different existing host and accepts matching config', () =
 test('remote plaintext hosts are rejected', () => fixture((_home, run) => {
   assert.equal(run(['doctor', '--host', 'http://example.com']).status, 1);
 }));
+
+test('doctor names a blocked host instead of blaming the token', async () => {
+  const { createServer } = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  // A proxy answering 403 in front of the hub: the health endpoint takes no
+  // token, so this can only be the network path.
+  const server = createServer((_request, response) => { response.statusCode = 403; response.end('blocked'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const child = spawn(process.execPath, [cli, 'doctor', '--host', `http://127.0.0.1:${server.address().port}`], { env: { ...process.env, AGENT_COLLAB_TOKEN: 'test-token' } });
+    let stderr = ''; child.stderr.on('data', chunk => stderr += chunk);
+    const status = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+    assert.equal(status, 1);
+    assert.match(stderr, /health endpoint returned 403/);
+    assert.match(stderr, /Do not rotate the token/);
+  } finally { server.close(); }
+});
+
+test('doctor reports an unreachable host before it asks for a token', async () => {
+  const { createServer } = await import('node:http');
+  const probe = createServer(() => {});
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  const result = spawnSync(process.execPath, [cli, 'doctor', '--host', `http://127.0.0.1:${port}`], { env: { ...process.env, AGENT_COLLAB_TOKEN: '' }, encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Cannot reach/);
+  assert.doesNotMatch(result.stderr, /Set AGENT_COLLAB_TOKEN/);
+});
 
 test('doctor completes initialization and preserves negotiated session headers', async () => {
   const { createServer } = await import('node:http');
