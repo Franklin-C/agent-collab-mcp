@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { acquireWorkerLock, processIsAbsent } from '../bin/worker-lock.mjs';
 import { canRetryStartup, runWithStartupRecovery } from '../bin/startup-recovery.mjs';
 
@@ -54,6 +56,38 @@ test('lock phase changes preserve ownership and legacy phase-less locks stay unv
   lock.setPhase('idle'); assert.equal(lock.ownsDirectory(state), true); lock.release();
   oldLock(state, { phase: undefined });
   assert.throws(() => acquireWorkerLock(state, 'owned', { recoverStale: true, probe: absent }), /unverifiable/);
+});
+
+test('concurrent real processes admit one lock owner and recover only after its idle process exits', async t => {
+  const state = fixture(t), moduleUrl = new URL('../bin/worker-lock.mjs', import.meta.url).href;
+  const script = `import { acquireWorkerLock } from ${JSON.stringify(moduleUrl)};
+    process.send('ready'); process.on('message', message => {
+      if (message !== 'acquire') return;
+      try { const lock = acquireWorkerLock(${JSON.stringify(state)}, 'parallel', { recoverStale: true }); process.send({ acquired: true }); }
+      catch (error) { process.send({ acquired: false, code: error.code }); process.disconnect(); }
+    });`;
+  const children = Array.from({ length: 8 }, () => spawn(process.execPath, ['--input-type=module', '-e', script], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }));
+  try {
+    await Promise.all(children.map(child => once(child, 'message')));
+    const results = children.map(child => once(child, 'message').then(([message]) => message));
+    for (const child of children) child.send('acquire');
+    const outcomes = await Promise.all(results);
+    assert.equal(outcomes.filter(result => result.acquired).length, 1);
+    assert.ok(outcomes.filter(result => !result.acquired).every(result => result.code === 'WORKER_LOCKED'));
+    const winner = children[outcomes.findIndex(result => result.acquired)];
+    const before = readFileSync(join(state, 'worker.lock'), 'utf8');
+    assert.equal(JSON.parse(before).pid, winner.pid);
+    assert.throws(() => acquireWorkerLock(state, 'parallel', { recoverStale: true }), { code: 'WORKER_LOCKED' });
+    assert.equal(readFileSync(join(state, 'worker.lock'), 'utf8'), before);
+    const exited = once(winner, 'exit'); winner.kill(); await exited;
+    assert.equal(processIsAbsent(winner.pid), true);
+    const recovered = acquireWorkerLock(state, 'parallel', { recoverStale: true });
+    assert.equal(recovered.isOwned(), true); recovered.release();
+  } finally {
+    await Promise.all(children.map(async child => {
+      if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }
+    }));
+  }
 });
 test('transient startup exits back off and then succeed without rerunning a normal stop', async () => {
   let attempts = 0; const waits = [];

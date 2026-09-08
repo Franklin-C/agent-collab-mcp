@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cleanupLocalWorktrees } from '../bin/cleanup.mjs';
@@ -29,6 +29,23 @@ test('apply removes a clean merged managed worktree and branch, keeping main and
 test('preserves untracked and ignored files', t => {
   const f = fixture(t); writeFileSync(join(f.tree, '.env'), 'local-secret');
   assert.ok(cleanupLocalWorktrees({ ...f, apply: true }).branches[0].reasons.includes('uncommitted_untracked_or_ignored_files')); assert.ok(existsSync(f.tree));
+});
+
+for (const flags of [['--assume-unchanged'], ['--skip-worktree'], ['--assume-unchanged', '--skip-worktree']]) test(`preserves edits hidden by index flags ${flags.join(' ')}`, t => {
+  const f = fixture(t);
+  const treeGit = args => execFileSync('git', args, { cwd: f.tree, encoding: 'utf8', windowsHide: true }).trim();
+  for (const flag of flags) treeGit(['update-index', flag, 'readme']);
+  writeFileSync(join(f.tree, 'readme'), 'hidden uncommitted work');
+  assert.equal(treeGit(['status', '--porcelain', '--untracked-files=all', '--ignored']), '', 'Git status cannot see these edits');
+  const flagsBefore = treeGit(['ls-files', '-v', '-z']);
+  for (const apply of [false, true]) {
+    const result = cleanupLocalWorktrees({ ...f, apply });
+    assert.equal(result.branches[0].state, 'retained');
+    assert.ok(result.branches[0].reasons.includes('index_flags_hide_worktree_changes'));
+    assert.equal(readFileSync(join(f.tree, 'readme'), 'utf8'), 'hidden uncommitted work');
+    assert.equal(treeGit(['ls-files', '-v', '-z']), flagsBefore, 'inspection must not change index flags');
+    assert.ok(f.git(['rev-parse', 'workforce/task-1']));
+  }
 });
 test('worker lock prevents cleanup even for fully merged work', t => {
   const f = fixture(t); writeFileSync(join(f.state, 'worker.lock'), '123');
