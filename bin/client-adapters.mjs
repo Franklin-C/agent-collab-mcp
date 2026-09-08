@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { clientActivity, clientUsageActivity } from './activity.mjs';
+import { codexConfigurationBinding, codexProfileName } from './codex-config.mjs';
 
 export const CLIENTS = {
   codex: { executable: 'codex', documentation: 'https://learn.chatgpt.com/docs/non-interactive-mode' },
@@ -56,14 +57,38 @@ export function inspectClient(client, executable = CLIENTS[client]?.executable) 
   const help = execFileSync(launch.command, [...launch.prefixArgs, ...helpArgs], { encoding: 'utf8', timeout: 15000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const compatible = client === 'codex' ? /--json/.test(help) : /--output-format/.test(help);
   if (!compatible) throw new Error(`${client} ${version} lacks required structured output; update the client or provide --executable for a compatible installation before supervising it.`);
-  return { client, executable: launch.command, prefixArgs: launch.prefixArgs, version, resume: client === 'codex' ? /^\s+resume\s/m.test(help) : client === 'claude-code' && /--resume/.test(help), compatible };
+  const versionParts = version.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
+  const profiles = client === 'codex' && /--profile/.test(help) && !!versionParts && (Number(versionParts[1]) > 0 || Number(versionParts[2]) >= 134);
+  return { client, executable: launch.command, prefixArgs: launch.prefixArgs, version, profiles, resume: client === 'codex' ? /^\s+resume\s/m.test(help) : client === 'claude-code' && /--resume/.test(help), compatible };
+}
+
+function selectedProfile(capability, options) {
+  const profile = codexProfileName(options.profile);
+  if (profile && (capability.client !== 'codex' || !capability.profiles)) throw new Error('--profile requires Codex 0.134.0 or later with supported configuration profile files.');
+  if (profile && !options.write) throw new Error('A Codex profile requires explicit --write enrollment; its permissions are selected by the operator.');
+  return profile;
+}
+export function executionBinding(capability, options = {}) {
+  const profile = selectedProfile(capability, options);
+  return { version: 1, client: capability.client, clientVersion: capability.version ?? null,
+    executable: capability.executable ?? null, prefixArgs: capability.prefixArgs ?? [], model: options.model ?? null,
+    write: options.write === true,
+    configuration: capability.client === 'codex' ? codexConfigurationBinding({ profile, env: options.env }) : null };
+}
+export function assertEnrollmentBinding(enrollment, capability, options = {}) {
+  const profile = selectedProfile(capability, options);
+  if (!enrollment?.execution && !profile) return null; // Existing unprofiled workers retain their prior enrollment contract.
+  const current = executionBinding(capability, options);
+  if (!enrollment?.verifiedAt || JSON.stringify(enrollment.execution) !== JSON.stringify(current)) throw Object.assign(new Error('The client, model, Codex home, profile, or configuration differs from verified enrollment. Rerun enrollment with the exact worker options.'), { code: 'ENROLLMENT_CHANGED', retryable: false });
+  return current;
 }
 
 export function invocation(capability, sessionId, options = {}) {
   if (sessionId && !/^[a-zA-Z0-9_-]{1,160}$/.test(sessionId)) throw new Error('Invalid client session identifier.');
   const model = options.model ? ['--model', options.model] : [];
   const prefix = capability.prefixArgs ?? [];
-  if (capability.client === 'codex') return { command: capability.executable, args: [...prefix, 'exec', ...(sessionId && capability.resume ? ['resume', sessionId] : ['--sandbox', options.write ? 'workspace-write' : 'read-only']), '--json', ...model, '-'] };
+  const profile = selectedProfile(capability, options);
+  if (capability.client === 'codex') return { command: capability.executable, args: [...prefix, ...(profile ? ['--profile', profile] : []), 'exec', ...(sessionId && capability.resume ? ['resume', sessionId] : profile ? [] : ['--sandbox', options.write ? 'workspace-write' : 'read-only']), '--json', ...model, '-'] };
   if (capability.client === 'claude-code') return { command: capability.executable, args: [...prefix, '--print', '--output-format', 'stream-json', '--verbose', '--permission-mode', options.write ? 'acceptEdits' : 'dontAsk', ...(sessionId ? ['--resume', sessionId] : []), ...model] };
   if (capability.client === 'gemini-cli') return { command: capability.executable, args: [...prefix, '--prompt', 'Process the Agent Collab event packet provided on stdin.', '--output-format', 'stream-json', '--approval-mode', options.write ? 'auto_edit' : 'default', ...(sessionId && capability.resume ? ['--resume', sessionId] : []), ...model] };
   throw new Error('Unsupported client.');

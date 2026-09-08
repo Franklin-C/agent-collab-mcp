@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 const cli = fileURLToPath(new URL('../bin/agent-collab-mcp.mjs', import.meta.url));
 function fixture(run) {
   const home = mkdtempSync(join(tmpdir(), 'agent-collab-cli-'));
-  try { run(home, (args) => spawnSync(process.execPath, [cli, ...args], { cwd: home, env: { ...process.env, HOME: home, USERPROFILE: home, AGENT_COLLAB_TOKEN: 'test-token' }, encoding: 'utf8' })); }
+  try { run(home, (args) => spawnSync(process.execPath, [cli, ...args], { cwd: home, env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: join(home, '.codex'), AGENT_COLLAB_TOKEN: 'test-token' }, encoding: 'utf8' })); }
   finally { rmSync(home, { recursive: true, force: true }); }
 }
 for (const [client, path, key] of [['cursor', '.cursor/mcp.json', 'mcpServers'], ['gemini-cli', '.gemini/settings.json', 'mcpServers'], ['antigravity', '.gemini/config/mcp_config.json', 'mcpServers'], ['muse-code', '.config/muse/settings.json', 'mcp_servers'], ['windsurf', '.codeium/windsurf/mcp_config.json', 'mcpServers'], ['vscode', '.vscode/mcp.json', 'servers']]) {
@@ -56,6 +56,21 @@ test('Codex rejects a different existing host and accepts matching config', () =
   const args = ['connect', '--host', 'https://example.com', '--client', 'codex'];
   assert.equal(run(args).status, 0); assert.equal(run(args).status, 0);
   assert.equal(run(['connect', '--host', 'https://another.example', '--client', 'codex']).status, 1);
+}));
+test('Codex --profile configures only an existing selected file and preserves global settings', () => fixture((home, run) => {
+  const configHome = join(home, '.codex'); mkdirSync(configHome);
+  const base = '[mcp_servers.agent-collab]\nurl = "https://base.example/api/mcp"\nbearer_token_env_var = "AGENT_COLLAB_TOKEN"\n';
+  const profile = 'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\n';
+  writeFileSync(join(configHome, 'config.toml'), base); writeFileSync(join(configHome, 'ehgi.config.toml'), profile);
+  const result = run(['connect', '--host', 'https://example.com', '--client', 'codex', '--profile', 'ehgi']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(join(configHome, 'config.toml'), 'utf8'), base);
+  const configured = readFileSync(join(configHome, 'ehgi.config.toml'), 'utf8');
+  assert(configured.startsWith(profile)); assert.match(configured, /\[mcp_servers.agent-collab\]/);
+  assert(!configured.includes('test-token'));
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'codex', '--profile', 'missing']).status, 1);
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'codex', '--profile', '../escape']).status, 1);
+  assert.equal(run(['connect', '--host', 'https://example.com', '--client', 'gemini-cli', '--profile', 'ehgi']).status, 1);
 }));
 test('remote plaintext hosts are rejected', () => fixture((_home, run) => {
   assert.equal(run(['doctor', '--host', 'http://example.com']).status, 1);
@@ -145,7 +160,7 @@ test('Codex doctor recognizes current and legacy tables without changing config'
       try {
         mkdirSync(join(home, '.codex'));
         const path = join(home, '.codex/config.toml'); writeFileSync(path, config);
-        const child = spawn(process.execPath, [cli, 'doctor', '--host', host, '--client', 'codex'], { env: { ...process.env, HOME: home, USERPROFILE: home, AGENT_COLLAB_TOKEN: 'test-token' } });
+        const child = spawn(process.execPath, [cli, 'doctor', '--host', host, '--client', 'codex'], { env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: join(home, '.codex'), AGENT_COLLAB_TOKEN: 'test-token' } });
         let stdout = '', stderr = '';
         child.stdout.on('data', chunk => stdout += chunk); child.stderr.on('data', chunk => stderr += chunk);
         const code = await new Promise(resolve => child.on('exit', resolve));

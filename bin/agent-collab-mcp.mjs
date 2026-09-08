@@ -3,7 +3,7 @@ import { work } from "./worker.mjs";
 import { enroll } from "./enroll.mjs";
 import { manageStartup } from "./service.mjs";
 import { cleanupLocalWorktrees } from "./cleanup.mjs";
-import { configureCodex } from "./codex-config.mjs";
+import { codexConfigPath, codexProfileName, configureCodex } from "./codex-config.mjs";
 // Agent Collab connector CLI. Dependency-free except mcp-remote for `serve`.
 import { execFileSync, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -40,11 +40,11 @@ for (let index = 0; index < rest.length; index += 1) {
 function usage(code = 0) {
   console.log(`agent-collab-mcp
 
-  connect <token> --host <url> [--client claude-code|codex|cursor|gemini-cli|antigravity|grok|muse-code|vscode|windsurf] [--print]
-  startup --state <dir> [--install --repo <repo> --host <url> --client <client> --model <model> --write | --uninstall]
-  enroll --host <url> --client <client> --repo <repo> --write [--model <model>] [--configure] [--start]
+  connect <token> --host <url> [--client claude-code|codex|cursor|gemini-cli|antigravity|grok|muse-code|vscode|windsurf] [--profile <codex-profile>] [--print]
+  startup --state <dir> [--install --repo <repo> --host <url> --client <client> --model <model> --profile <codex-profile> --write | --uninstall | --reset-recovery]
+  enroll --host <url> --client <client> --repo <repo> --write [--model <model>] [--profile <codex-profile>] [--configure] [--start]
   cleanup --repo <repo> --state <worker-state> [--base main] [--verify-github] [--apply]
-  worker --host <url> --client codex|claude-code|gemini-cli --repo <approved-repo> --write [--model <model>] [--once]
+  worker --host <url> --client codex|claude-code|gemini-cli --repo <approved-repo> --write [--model <model>] [--profile <codex-profile>] [--once]
   supervise --host <url> --client codex|claude-code|gemini-cli [--cwd <repo>] [--write] [--retry-failed]
   watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once]
   doctor --host <url> [--client <name>] [--report] check connection/config (reads AGENT_COLLAB_TOKEN;
@@ -143,8 +143,13 @@ async function doctor() {
     if (flags.client !== "vscode" && entry.headers?.Authorization !== `Bearer ${token}`) throw new Error(`Saved token in ${path} differs from AGENT_COLLAB_TOKEN. Run connect again.`);
     configuration = "verified";
   } else if (flags.client === "codex") {
-    configPath = join(homedir(), ".codex", "config.toml");
-    const config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+    configPath = codexConfigPath({ profile: flags.profile });
+    let config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+    if (flags.profile && !existsSync(configPath)) throw new Error(`Selected Codex profile is missing at ${configPath}.`);
+    if (flags.profile && !/^[ \t]*\[mcp_servers\.(?:agent[-_]collab|"agent[-_]collab"|'agent[-_]collab')\]/m.test(config)) {
+      const basePath = codexConfigPath();
+      config = existsSync(basePath) ? readFileSync(basePath, "utf8") : "";
+    }
     // The Codex CLI uses the supplied name verbatim; older connector installs
     // used an underscore. Inspect either table without rewriting user settings.
     const entries = [...config.matchAll(/^[ \t]*\[mcp_servers\.(?:agent[-_]collab|"agent[-_]collab"|'agent[-_]collab')\][ \t]*(?:#[^\r\n]*)?\r?\n([\s\S]*?)(?=^[ \t]*\[|$(?![\s\S]))/gm)];
@@ -260,7 +265,7 @@ function connect() {
     }
 
     case "codex": {
-      const path = join(home, ".codex", "config.toml");
+      const path = codexConfigPath({ profile: flags.profile });
       const block = `\n[mcp_servers.agent_collab]\nurl = ${JSON.stringify(url)}\nbearer_token_env_var = "AGENT_COLLAB_TOKEN"\ntool_timeout_sec = 120\n`;
 
       if (print) {
@@ -268,10 +273,13 @@ function connect() {
         break;
       }
 
+      if (flags.profile && !existsSync(path)) throw new Error('Create the selected Codex <name>.config.toml profile with your scoped permissions first; --configure only adds its MCP connection.');
       mkdirSync(dirname(path), { recursive: true });
       const current = existsSync(path) ? readFileSync(path, "utf8") : "";
 
-      const configured = configureCodex(current, url);
+      const inheritedPath = codexConfigPath();
+      const inherited = flags.profile && existsSync(inheritedPath) ? readFileSync(inheritedPath, 'utf8') : '';
+      const configured = configureCodex(current, url, { inherited });
       if (configured !== current) safeWrite(path, configured);
       else console.log(`${path}: matching configuration already present.`);
 
@@ -395,26 +403,30 @@ function env() {
 }
 
 try {
+if (flags.profile !== undefined) {
+  codexProfileName(flags.profile);
+  if (flags.client !== 'codex' || !['connect', 'doctor', 'enroll', 'worker', 'startup'].includes(command)) throw new Error('--profile is supported only for Codex connect, doctor, enroll, worker, and startup commands.');
+}
 switch (command) {
   case "update-check":
     console.log(JSON.stringify(await checkUpdate({ force: true })));
     break;
   case "startup":
-    console.log(JSON.stringify(await manageStartup({ action: flags.install === "true" ? "install" : flags.uninstall === "true" ? "uninstall" : "status", install: flags.install === "true", uninstall: flags.uninstall === "true", write: flags.write === "true", repo: flags.repo, state: flags.state, host: flags.host, client: flags.client, model: flags.model, executable: flags.executable }), null, 2));
+    console.log(JSON.stringify(await manageStartup({ action: flags.install === "true" ? "install" : flags.uninstall === "true" ? "uninstall" : flags['reset-recovery'] === 'true' ? 'reset' : "status", install: flags.install === "true", uninstall: flags.uninstall === "true", resetRecovery: flags['reset-recovery'] === 'true', write: flags.write === "true", repo: flags.repo, state: flags.state, host: flags.host, client: flags.client, model: flags.model, profile: flags.profile, executable: flags.executable }), null, 2));
     break;
   case "cleanup":
     console.log(JSON.stringify(cleanupLocalWorktrees({ repo: flags.repo, state: flags.state, base: flags.base, apply: flags.apply === "true", verifyGitHub: flags["verify-github"] === "true" }), null, 2));
     break;
   case "enroll": {
     if (flags.configure === "true") connect();
-    const options = { host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model };
+    const options = { host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile };
     const result = await enroll(options);
     console.log(JSON.stringify(result));
     if (flags.start === "true") await work({ ...options, state: result.state });
     break;
   }
   case "worker":
-    await work({ host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, once: flags.once === "true" });
+    await work({ host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile, once: flags.once === "true" });
     break;
   case "supervise":
     await checkUpdate();
