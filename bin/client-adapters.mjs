@@ -40,7 +40,7 @@ export function readClientEvent(line) {
 export async function runClient(capability, prompt, options = {}) {
   const call = invocation(capability, options.sessionId, options);
   return await new Promise((resolve, reject) => {
-    const child = spawn(call.command, call.args, { cwd: options.cwd, env: options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = (options.spawn ?? spawn)(call.command, call.args, { cwd: options.cwd, env: options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
     let buffer = '', sessionId = options.sessionId ?? null, failed = false, completed = false, bytes = 0, settled = false;
     const stop = () => { child.kill('SIGTERM'); setTimeout(() => { if (!settled) child.kill('SIGKILL'); }, 5000).unref(); };
     const timer = setTimeout(() => { failed = true; stop(); }, options.timeoutMs ?? 15 * 60000); timer.unref();
