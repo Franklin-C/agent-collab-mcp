@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { archiveHandoff, git, githubRepository, inside, readHandoffSnapshot, recoveryCheckpoint, requestWorkerApi, restoreCheckpoint, work } from '../bin/worker.mjs';
+import { executionBinding } from '../bin/client-adapters.mjs';
 const response = body => new Response(JSON.stringify(body), { status: 200 });
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'workforce-test-')), repo = join(root, 'repo'), state = join(root, 'state');
@@ -149,6 +150,55 @@ for (const [flag, outcome] of [['requiresAuthentication', 'needs_auth'], ['requi
   const finish = f.sent.find(item => item.data.action === 'finish')?.data;
   assert.equal(finish.succeeded, false); assert.equal(finish.handoff.outcome, outcome);
   assert(!JSON.stringify(finish).includes('PRIVATE'));
+});
+
+test('a terminal client permission or authentication failure ends a continuous worker before its next claim', async t => {
+  for (const flag of ['requiresAuthentication', 'requiresApproval']) {
+    const f = executableFixture(t);
+    await work({ ...f.options, once: false, runClient: async () => { throw Object.assign(Error('denied'), { [flag]: true }); } });
+    assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+    assert.equal(existsSync(join(f.state, 'worker.lock')), false);
+  }
+});
+
+test('worker binding guards run before network calls and forward the verified profile into the actual invocation', async t => {
+  const f = executableFixture(t), home = join(f.root, 'codex-home'); mkdirSync(home);
+  const capability = { ...f.options.capability, executable: process.execPath, profiles: true };
+  await work({ ...f.options, capability, fetch: async () => response({ job: null }) });
+  writeFileSync(join(home, 'config.toml'), 'model = "base"\n');
+  const profilePath = join(home, 'ehgi.config.toml'), content = 'approval_policy = "on-request"\n'; writeFileSync(profilePath, content);
+  const options = { ...f.options, capability, profile: 'ehgi', env: { ...process.env, CODEX_HOME: home } };
+  const path = join(f.state, 'state.json'), saved = JSON.parse(readFileSync(path, 'utf8'));
+  saved.enrollment = { verifiedAt: new Date().toISOString(), execution: executionBinding(capability, options) }; writeFileSync(path, JSON.stringify(saved));
+  writeFileSync(profilePath, 'approval_policy = "never"\n');
+  await assert.rejects(work({ ...options, fetch: async () => assert.fail('changed binding must stop before HTTP') }), error => error.code === 'ENROLLMENT_CHANGED');
+  assert.equal(existsSync(join(f.state, 'worker.lock')), false);
+  writeFileSync(profilePath, content);
+  let turns = 0;
+  await work({ ...options, runClient: async (client, prompt, args) => {
+    turns++; assert.equal(args.profile, 'ehgi'); assert.equal(args.env.CODEX_HOME, home);
+    assert.equal(JSON.parse(readFileSync(join(f.state, 'worker.lock'), 'utf8')).phase, 'client_active');
+    return f.options.runClient(client, prompt, args);
+  } });
+  assert.equal(turns, 1);
+});
+
+for (const moment of ['after-claim', 'during-fetch', 'before-client']) test(`an actual origin change ${moment} stops the continuous worker before any paid run`, async t => {
+  const f = executableFixture(t); let turns = 0, heartbeats = 0;
+  const change = () => git(f.repo, ['remote', 'set-url', 'origin', 'https://github.com/unrelated/repository.git']);
+  await work({ ...f.options, once: false,
+    git: (cwd, args) => { if (moment === 'during-fetch' && args[0] === 'fetch') change(); return f.options.git(cwd, args); },
+    fetch: async (url, options) => {
+      const data = JSON.parse(options.body), result = await f.options.fetch(url, options);
+      if (moment === 'after-claim' && data.action === 'claim') change();
+      if (data.action === 'heartbeat' && ++heartbeats === 3 && moment === 'before-client') change();
+      return result;
+    }, runClient: async () => { turns++; assert.fail('changed origin must never reach a model'); },
+  });
+  assert.equal(turns, 0); assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+  const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  assert.equal(finish.succeeded, false); assert.match(finish.note, /origin changed/);
+  assert.equal(existsSync(join(f.state, 'worker.lock')), false);
 });
 
 test('handoff cleanup preserves changed or tracked files and rejects paths outside worker ownership', t => {

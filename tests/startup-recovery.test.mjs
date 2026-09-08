@@ -8,7 +8,7 @@ import { canRetryStartup, runWithStartupRecovery } from '../bin/startup-recovery
 
 function fixture(t) { const state = mkdtempSync(join(tmpdir(), 'ehgi-lock-')); t.after(() => rmSync(state, { recursive: true, force: true })); return state; }
 const absent = () => { throw Object.assign(new Error('absent'), { code: 'ESRCH' }); };
-const oldLock = (state, patch = {}) => writeFileSync(join(state, 'worker.lock'), JSON.stringify({ version: 1, pid: 99999, nonce: '01234567-0123-0123-0123-0123456789ab', identity: 'owned', ...patch }));
+const oldLock = (state, patch = {}) => writeFileSync(join(state, 'worker.lock'), JSON.stringify({ version: 1, pid: 99999, nonce: '01234567-0123-0123-0123-0123456789ab', identity: 'owned', phase: 'idle', ...patch }));
 
 test('recovers only its matching saved identity when PID absence is proved', t => {
   const state = fixture(t); oldLock(state);
@@ -39,6 +39,21 @@ test('PID probing treats only ESRCH as evidence, and rejects unsafe PID values',
   assert.equal(processIsAbsent(123, absent), true);
   assert.equal(processIsAbsent(0, absent), false); assert.equal(processIsAbsent(-1, absent), false);
   assert.equal(processIsAbsent(123, () => { throw Error('unknown'); }), false);
+});
+
+test('a crashed active-client lock remains even when the worker PID is absent', t => {
+  const state = fixture(t); oldLock(state, { phase: 'client_active' });
+  assert.throws(() => acquireWorkerLock(state, 'owned', { recoverStale: true, probe: absent }), /interrupted during client/);
+  assert.equal(JSON.parse(readFileSync(join(state, 'worker.lock'), 'utf8')).phase, 'client_active');
+});
+
+test('lock phase changes preserve ownership and legacy phase-less locks stay unverifiable', t => {
+  const state = fixture(t), lock = acquireWorkerLock(state, 'owned');
+  lock.setPhase('client_active'); assert.equal(lock.isOwned(), true);
+  assert.equal(JSON.parse(readFileSync(join(state, 'worker.lock'), 'utf8')).phase, 'client_active');
+  lock.setPhase('idle'); assert.equal(lock.ownsDirectory(state), true); lock.release();
+  oldLock(state, { phase: undefined });
+  assert.throws(() => acquireWorkerLock(state, 'owned', { recoverStale: true, probe: absent }), /unverifiable/);
 });
 test('transient startup exits back off and then succeed without rerunning a normal stop', async () => {
   let attempts = 0; const waits = [];

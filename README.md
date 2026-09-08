@@ -1,4 +1,4 @@
-# EhGI connector 0.3.0
+# EhGI connector 0.3.1
 
 Connect coding clients to EhGI, verify their execution permissions, and run fresh
 assignments through an operator-started companion. The owned npm package name is
@@ -44,13 +44,60 @@ account or publication permissions. Codex and Gemini workers require `--model`
 for usage attribution. Missing provider login or approval remains actionable
 setup work; the connector never disables approval controls to get past it.
 
-Use a dedicated client profile with repository access and only the required MCP
-tools approved. Run enrollment against that exact profile; keep global approval
-policy unchanged. In a local diagnostic, Codex 0.153.4 completed its probe in
-44.13 seconds with `--approve-for-me`, the Windows unelevated sandbox and two
-approved MCP probe tools. Those scoped diagnostic options are not the default
-adapter command. Workspace-write mode alone did not prove execution permission;
-the tested `never` policy could block even local reads.
+For Codex, `--profile NAME` selects an existing `$CODEX_HOME/NAME.config.toml`
+(`~/.codex/NAME.config.toml` by default). It requires Codex 0.134.0 or later
+advertising `--profile`. Current Codex versions use separate profile files;
+legacy `[profiles.NAME]` tables are not supported by this path. The connector
+passes the profile to the actual CLI and leaves its permissions intact.
+Without a profile, the existing workspace-write adapter behavior is unchanged.
+
+Create a profile with permissions appropriate for the repository and account.
+For an operator-authorized workflow that uses automatic approval review, the
+documented current configuration is:
+
+```toml
+# $CODEX_HOME/ehgi-workforce.config.toml
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+default_permissions = ":workspace"
+```
+
+Automatic review still enforces the sandbox boundary and can deny requests.
+Managed requirements and trusted project configuration still apply. Keep MCP
+approval exceptions limited to the tools the operator authorizes; the connector
+does not add approval exceptions. Native Windows also needs its normal Codex
+sandbox setup. These settings and file layout are documented in OpenAI's
+[profiles](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles),
+[automatic review](https://learn.chatgpt.com/docs/sandboxing/auto-review), and
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+Use the same profile, model, executable, Codex home, and worker state throughout:
+
+```sh
+agent-collab-mcp enroll --host https://ehgi.ai --client codex --profile ehgi-workforce --repo /absolute/checkout --state /absolute/private-worker-state --model YOUR_MODEL --write --configure
+agent-collab-mcp worker --host https://ehgi.ai --client codex --profile ehgi-workforce --repo /absolute/checkout --state /absolute/private-worker-state --model YOUR_MODEL --write
+agent-collab-mcp startup --install --host https://ehgi.ai --client codex --profile ehgi-workforce --repo /absolute/checkout --state /absolute/private-worker-state --model YOUR_MODEL --write
+```
+
+With `--profile`, `--configure` adds the MCP connection only to that existing
+profile and preserves global settings. `CODEX_HOME` also selects the authentication
+home; sign in there before enrollment. The token remains in `AGENT_COLLAB_TOKEN`.
+Enrollment records local hashes of the base config and selected profile plus
+the client installation, version, model and Codex home. Changing those inputs
+requires another real probe before work or startup installation. Config contents
+and these local bindings are not uploaded. This detects configuration drift;
+it does not resolve every managed or project configuration layer or certify all
+future tool calls. Real enrollment proves the MCP roundtrip and local file edit.
+If Codex initializes repository trust or changes configuration during the first
+probe, enrollment rejects that change. Review the saved settings and rerun with
+the same files; do not regenerate the original config between attempts.
+
+On September 8, 2026, native Windows Codex 0.153.4 passed the shipped enrollment
+CLI against an isolated local hub with `--profile ehgi-worker`, the workspace
+permission boundary, automatic review and the unelevated Windows sandbox. The
+probe verified MCP, the local proof file and provider usage using the saved
+configuration. This verifies that enrollment path; it does not certify every
+client, a production deployment, or the complete assignment lifecycle.
 
 `connect <token> --host <url> --client <name>` remains available for explicit
 configuration. It preserves existing client configuration and makes backups.
@@ -104,16 +151,21 @@ It registers the next user login and does not launch a nested background worker.
 | Linux | systemd user service | Secret Service via `secret-tool` |
 
 The launcher retries classified connection failures at most three times, after
-1, 4 and 15 seconds. Stop/pause, revoked access, approval requests, lock conflicts
-and unknown failures remain final; idle retries make no model calls. Startup
-recovers a versioned worker lock only when its identity matches and the OS proves
-its saved PID is absent. Live/reused/inaccessible PIDs, legacy locks and abandoned
-acquisition guards are retained. Native services do not repeatedly restart an
-exited or killed launcher.
+1, 4 and 15 seconds. Native services restart abnormal exits, with a durable ledger
+allowing at most three process-crash recoveries. Stop/pause, revoked access,
+approval requests, lock conflicts and unknown failures remain paused across
+logins; idle retries make no model calls. After repairing the cause, explicitly
+run `startup --reset-recovery --state /absolute/private-worker-state`. This
+resets the ledger without starting a worker or granting permissions.
+
+Crash recovery preserves locks interrupted during client execution: orphaned CLI
+descendants cannot safely be assumed dead. Only idle locks with matching identity
+and an OS-confirmed absent PID can be reclaimed. Live/reused/inaccessible PIDs,
+legacy locks and abandoned acquisition guards remain for inspection.
 
 If a user service manager, keyring or provider authorization is unavailable,
 repair it and verify a real assignment. This source includes generation,
-escaping, recovery and lock tests; it does not claim native startup acceptance on
+escaping, real failed-process recovery and lock tests; it does not claim native startup acceptance on
 each operating system. Uninstall preserves recovery worktrees, checkpoints and
 the stored credential.
 
@@ -150,7 +202,21 @@ setting and preserves branches needed by tasks, PRs or active agents. The merge
 UI and `merge_merge_request` with `{"pr_number": 123, "action": "cleanup", "dry_run": true}` support preview; set `dry_run` to `false` to apply.
 Request, commit and audit history remain available after branch removal.
 
-Local managed worktrees are cleaned separately:
+Workers automatically check local housekeeping at idle and acknowledged-job
+boundaries, once per minute in rotating batches of ten. The hub verifies the
+exact job/fence and terminal task state before and after fetching the base.
+Active leases/workspaces, uncertain receipts, replaced fences and incomplete
+acceptance remain ineligible. The existing worker lock stays held throughout
+cleanup. Local Git checks still preserve dirty, ignored, untracked and unmerged
+work. No extra model calls are made, and remote refs and archived handoffs remain.
+At most 100 receipts remain actionable. Replaced executions, absent branches and
+overflow are recorded in `housekeeping-retained.jsonl`, with its count and name
+saved in worker state. Their worktrees and source remain intact for inspection or
+explicit cleanup. Origin checks repeat before fetch, client execution and cleanup;
+a repository change pauses the worker instead of trusting another repository's
+merge history.
+
+Local managed worktrees can also be cleaned explicitly:
 
 ```sh
 agent-collab-mcp cleanup --repo /absolute/checkout --state /absolute/private-worker-state --base main
