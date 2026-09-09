@@ -133,6 +133,14 @@ stale fences and budget limits still cancel execution immediately when observed.
 
 The worker renews fenced leases, persists bounded recovery checkpoints and
 provider usage, and reports blockers. Independent workers can run concurrently.
+An independent monotonic watchdog requests cancellation ten seconds before the
+last acknowledged execution lease expires, measured from the request's start.
+Older hubs default to a 90-second lease; longer advertised leases remain capped
+at that duration. Slow usage delivery or checkpoints cannot renew authority,
+and a late response cannot restore it. Live Git checkpoints run asynchronously
+with a bounded deadline so they do not block the watchdog. HTTP 401 or 403 from
+worker, usage or activity reporting stops the continuous worker; a later
+successful response cannot start another coding session in that process.
 Idle polling makes no model calls. A `more_work` handoff can continue within its
 attempt limit; relevant answers, dependency changes and review feedback make
 blocked work eligible again. A finished client response does not imply that its

@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { archiveHandoff, git, githubRepository, inside, readHandoffSnapshot, recoveryCheckpoint, requestWorkerApi, restoreCheckpoint, work } from '../bin/worker.mjs';
+import { archiveHandoff, git, githubRepository, inside, readHandoffSnapshot, recoveryCheckpoint, recoveryCheckpointAsync, requestWorkerApi, restoreCheckpoint, work } from '../bin/worker.mjs';
 import { executionBinding, runClient } from '../bin/client-adapters.mjs';
 const response = body => new Response(JSON.stringify(body), { status: 200 });
 function fixture(t) {
@@ -22,6 +22,65 @@ test('recovery preserves tracked and untracked source, excluding local secrets',
   assert.equal(readFileSync(join(restored, 'app.txt'), 'utf8'), 'changed\n'); assert.equal(readFileSync(join(restored, 'new.txt'), 'utf8'), 'new\n'); assert.equal(existsSync(join(restored, '.env.local')), false);
   assert.throws(() => restoreCheckpoint(restored, { ...checkpoint, digest: '0'.repeat(64) }), /corrupt/);
 });
+test('asynchronous recovery preserves the same source and binary patch without changing the real index', async t => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'app.txt'), 'staged version\n'); git(f.repo, ['add', 'app.txt']);
+  const staged = git(f.repo, ['diff', '--cached', '--binary']);
+  writeFileSync(join(f.repo, 'app.txt'), 'working version\n');
+  writeFileSync(join(f.repo, 'new.txt'), 'new source\n');
+  const binary = Buffer.from([0, 255, 3, 0, 128]); writeFileSync(join(f.repo, 'asset.bin'), binary);
+  writeFileSync(join(f.repo, '.env.local'), 'SECRET=never-upload');
+  const expected = recoveryCheckpoint(f.repo, f.sha, f.state);
+  const checkpoint = await recoveryCheckpointAsync(f.repo, f.sha, f.state);
+  assert.deepEqual(checkpoint, expected);
+  assert.equal(git(f.repo, ['diff', '--cached', '--binary']), staged);
+  assert.equal(readFileSync(join(f.repo, 'app.txt'), 'utf8'), 'working version\n');
+  assert.deepEqual(readdirSync(f.state), []);
+  const restored = join(f.root, 'restored'); git(f.repo, ['worktree', 'add', '--detach', restored, f.sha]);
+  restoreCheckpoint(restored, checkpoint);
+  assert.equal(readFileSync(join(restored, 'app.txt'), 'utf8'), 'working version\n');
+  assert.equal(readFileSync(join(restored, 'new.txt'), 'utf8'), 'new source\n');
+  assert.deepEqual(readFileSync(join(restored, 'asset.bin')), binary);
+  assert.equal(existsSync(join(restored, '.env.local')), false);
+});
+
+test('an already aborted asynchronous checkpoint leaves source and temporary state untouched', async t => {
+  const f = fixture(t), stop = new AbortController(); stop.abort();
+  writeFileSync(join(f.repo, 'app.txt'), 'retained edit\n');
+  await assert.rejects(recoveryCheckpointAsync(f.repo, f.sha, f.state, stop.signal), error => error.name === 'AbortError');
+  assert.equal(readFileSync(join(f.repo, 'app.txt'), 'utf8'), 'retained edit\n');
+  assert.deepEqual(readdirSync(f.state), []);
+  assert.equal(git(f.repo, ['diff', '--cached']), '');
+});
+
+test('cancelling an in-flight asynchronous checkpoint waits for Git close before cleaning its private index', { timeout: 10000 }, async t => {
+  const f = fixture(t), marker = join(f.state, 'filter-started'), finished = join(f.state, 'filter-finished');
+  const helper = join(f.root, 'checkpoint-filter.cjs');
+  writeFileSync(helper, `const fs=require('node:fs');let input=[];process.stdin.on('data',chunk=>input.push(chunk));process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(marker)},'started');setTimeout(()=>{fs.writeFileSync(${JSON.stringify(finished)},'finished');process.stdout.end(Buffer.concat(input));},500);});`);
+  const quote = path => `"${path.replaceAll('\\', '/')}"`;
+  git(f.repo, ['config', 'filter.checkpoint-audit.clean', `${quote(process.execPath)} ${quote(helper)}`]);
+  git(f.repo, ['config', 'filter.checkpoint-audit.required', 'true']);
+  writeFileSync(join(f.repo, '.gitattributes'), 'app.txt filter=checkpoint-audit\n');
+  writeFileSync(join(f.repo, 'app.txt'), 'retained during cancellation\n');
+  const staged = git(f.repo, ['diff', '--cached']), stop = new AbortController();
+  const attempt = recoveryCheckpointAsync(f.repo, f.sha, f.state, stop.signal);
+  // Attach rejection handling before signalling cancellation.
+  const result = attempt.then(() => ({ succeeded: true }), error => ({ error }));
+  const deadline = Date.now() + 5000;
+  while (!existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(existsSync(marker), true, 'real Git clean filter reached its asynchronous wait');
+  assert(readdirSync(f.state).some(name => name.startsWith('index-')), 'private Git index exists during the active child');
+  stop.abort();
+  const settled = await result;
+  // Let the finite fixture filter settle before assertions/teardown, including
+  // on implementations where cancellation currently fails during cleanup.
+  while (!existsSync(finished) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(settled.error?.name, 'AbortError', settled.error?.stack);
+  assert.equal(readFileSync(join(f.repo, 'app.txt'), 'utf8'), 'retained during cancellation\n');
+  assert.equal(git(f.repo, ['diff', '--cached']), staged);
+  assert.deepEqual(readdirSync(f.state).filter(name => name.startsWith('index-')), []);
+});
+
 test('worker validates origin and keeps filesystem paths inside its state', () => {
   assert.equal(githubRepository('git@github.com:Example/Project.git'), 'example/project'); assert.equal(githubRepository('https://github.com/Example/Project'), 'example/project');
   assert.throws(() => githubRepository('https://attacker.test/example/project'), /GitHub origin/); assert.equal(inside('/work', '/work/../secrets'), false); assert.equal(inside('/work', '/work'), false);
@@ -57,7 +116,7 @@ function executableFixture(t, finishSucceeds = true) {
       const data = JSON.parse(request.body); sent.push({ url, data });
       if (data.action === 'claim') return response({ job, repository: { owner: 'fixture', repo: 'repo', base: 'main' } });
       if (data.action === 'finish') return finishSucceeds ? response({ recorded: true }) : new Response('{}', { status: 503 });
-      return response({});
+      return response(data.action === 'heartbeat' ? { stop: false } : {});
     },
     runClient: async (_client, _prompt, args) => { assert.equal(args.env.AGENT_COLLAB_TOKEN, 'test'); args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } }); writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(handoff)); return { completed: true }; },
   };
@@ -490,9 +549,24 @@ test('repeated terminal heartbeats cannot extend a real child finalization deadl
 });
 
 for (const restrictive of ['Operator requested agent stop', 'Job cost limit reached', 401, 409]) test(`finalization grace immediately yields to ${restrictive}`, async t => {
-  const f = finalizingChildFixture(t, { restrictive }); await work(f.options);
+  const f = finalizingChildFixture(t, { restrictive });
+  if (restrictive === 401) {
+    const run = f.options.runClient;
+    f.options.runClient = async (capability, prompt, args) => {
+      writeFileSync(join(args.cwd, 'auth-retained.txt'), 'Unpublished fixture changes\n');
+      return run(capability, prompt, args);
+    };
+  }
+  await work(f.options);
   assert.equal(f.observed().graceTimers, 1); assert.equal(f.observed().cancelled, true);
   const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  if (restrictive === 401) {
+    assert.equal(finish, undefined, 'revocation prevents further authenticated task mutations');
+    assert.equal(existsSync(f.archive), false);
+    assert.equal(readFileSync(join(f.cwd, 'auth-retained.txt'), 'utf8'), 'Unpublished fixture changes\n');
+    assert.equal(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).active.jobId, 'coord-agent');
+    return;
+  }
   assert.equal(finish.succeeded, false); assert.equal(finish.handoff, undefined); assert.equal(existsSync(f.archive), false);
   assert.equal(finish.note, typeof restrictive === 'number' ? 'Execution authorization or fence changed' : restrictive);
 });
