@@ -40,6 +40,48 @@ test('client file proof and hub roundtrip both required before readiness is save
   assert.equal(JSON.parse(readFileSync(join(options.state, 'state.json'))).enrollment.capabilities.verifiedExecution, true);
 });
 
+test('live enrollment snapshots drain serially while the client is still running', { timeout: 5000 }, async t => {
+  const options = fixture(t), delivered = []; let active = 0, peak = 0, clientRunning = false, release;
+  const allDelivered = new Promise(resolve => { release = resolve; });
+  await enroll({ ...options, fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) {
+      assert.equal(clientRunning, true); active++; peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      delivered.push(JSON.parse(request.body)); active--;
+      if (delivered.length === 2) release();
+    }
+    return options.fetch(url, request);
+  }, runClient: async (_client, prompt, run) => {
+    clientRunning = true;
+    for (const input of [10, 20]) run.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: `snapshot-${input}`, usage: { input_tokens: input, output_tokens: 2, cached_input_tokens: 0 } });
+    await allDelivered;
+    writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
+    clientRunning = false; return { completed: true };
+  } });
+  assert.equal(peak, 1); assert(delivered.every(report => report.cumulative === true));
+  assert.equal(delivered[0].session_id, delivered[1].session_id);
+  assert.notEqual(delivered[0].event_id, delivered[1].event_id);
+});
+
+test('enrollment final delivery has a deadline and retains its unacknowledged event', async t => {
+  const options = fixture(t), originalTimeout = globalThis.setTimeout; let attempted;
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 5000 ? 30 : ms, ...args));
+  await enroll({ ...options, fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) {
+      attempted = JSON.parse(request.body);
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled delivery'), { name: 'AbortError' })), { once: true });
+      });
+    }
+    return options.fetch(url, request);
+  }, runClient: async (_client, prompt, run) => {
+    run.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: 'final', usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } });
+    writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
+    return { completed: true };
+  } });
+  assert.deepEqual(JSON.parse(readFileSync(join(options.state, 'state.json'))).usage, [attempted]);
+});
+
 test('enrollment forwards the selected profile and saves its exact local configuration binding', async t => {
   const options = fixture(t), profile = join(options.env.CODEX_HOME, 'ehgi.config.toml');
   writeFileSync(profile, 'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\n');

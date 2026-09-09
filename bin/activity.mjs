@@ -101,8 +101,8 @@ export function clientUsageActivity(client, raw) {
   let inputTokens, outputTokens, cachedInputTokens, usageScope;
   if (client === 'codex' && event?.type === 'turn.completed') {
     ({ input_tokens: inputTokens, output_tokens: outputTokens, cached_input_tokens: cachedInputTokens } = event.usage ?? {}); usageScope = 'turn';
-  } else if (client === 'codex' && event?.type === 'ehgi.codex_usage_recovery') {
-    ({ input_tokens: inputTokens, output_tokens: outputTokens, cached_input_tokens: cachedInputTokens } = event.run_usage ?? {}); usageScope = 'run';
+  } else if (client === 'codex' && event?.type === 'ehgi.codex_usage_snapshot') {
+    ({ input_tokens: inputTokens, output_tokens: outputTokens, cached_input_tokens: cachedInputTokens } = event.usage ?? {}); usageScope = 'run';
   } else if (client === 'gemini-cli' && event?.type === 'result') {
     ({ input_tokens: inputTokens, output_tokens: outputTokens, cached: cachedInputTokens } = event.stats ?? {}); usageScope = 'run';
   } else if (client === 'claude-code' && event?.type === 'result' && event.modelUsage) {

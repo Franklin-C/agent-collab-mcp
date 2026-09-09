@@ -251,28 +251,38 @@ prompts, source, tool arguments/results, paths and credentials. Reports are
 batched and retried with stable IDs. Detailed activity stays outside model
 context unless an assignment needs it; reading updates still consumes tokens.
 
-Usage is reported when the client emits it, often at turn completion. Missing
-totals are not guessed. Stable usage event IDs prevent duplicate accounting on
-retry, and reporting failures never justify repeating completed coding work.
-When a Codex invocation is interrupted, the adapter reads only that invocation's
-exact session checkpoint and reports provider token totals absent from its
-structured output. It never substitutes estimates or attributes another
-session's counters. A stopped worker gives pending usage one bounded five-second
-delivery window after its child exits; failed deliveries stay in local state.
+Usage comes only from provider-reported counters. Codex samples its exact local
+session checkpoint every five seconds while running, with bounded asynchronous
+reads and one final sample after exit. One normalizer reconciles these counts
+with stdout into cumulative totals for a fresh billing invocation, so the final
+report does not charge interim tokens again. A successful fresh run can still
+use final stdout when no checkpoint becomes available. Other adapters report
+the structured usage their clients emit, often at turn completion.
 
-Missing or ambiguous checkpoint usage persistently pauses further paid work in
-the worker's local `usageAttention` record. Restarting, resetting startup
-recovery or re-enrolling does not clear it. An operator must reconcile the
-retained session's actual usage before clearing that record. Checkpoint recovery
-runs on invocation exit: cost visibility during a long active turn still depends
-on the client's emitted reports and may be delayed.
+Readers check the exact session and workspace, file identity, append-only
+content, counter consistency and deadlines. Explicit native resume subtracts a
+pre-launch baseline and pauses on ambiguous accounting. The worker interleaves
+usage delivery with budget, Stop and lease checks; a growing outbox cannot defer
+those checks indefinitely. After the child exits, final delivery has a separate
+five-second bound and keeps unacknowledged reports and stable IDs for retry.
+Reporting failures never justify repeating completed coding work.
+
+Unrecoverable or ambiguous usage persistently pauses further paid work in the
+local `usageAttention` record. Restarting, resetting startup recovery or
+re-enrolling does not clear it. An operator must reconcile the retained session
+before clearing that record. Provider checkpoint delay, polling and delivery
+latency still permit overshoot; this is not a strict spending ceiling. Passive
+sampling adds no model calls, but more reports create additional hub requests.
 
 Supervisor `--phase implementation|review|coordination` is optional; use it only
 when the phase is known. Worker assignments supply their own phase.
 
-The latest local probe used Codex 0.153.4 with the scoped permissions above.
-Claude Code 2.1.139 was logged out; Gemini CLI 0.58.0 supported the adapter but had
-no configured authentication method. These observations do not certify 0.3.0.
+The native trials used two Codex 0.153.4 clients with the scoped permissions above.
+The later live-meter correction passed fixture tests and replayed all eleven
+retained sessions' counters exactly; actual live disk-flush timing and native
+explicit-resume acceptance remain to be tested. At the last provider probe,
+Claude Code 2.1.139 was logged out and Gemini CLI 0.58.0 had no configured
+authentication method.
 Rollout still needs actual enrollment, concurrent tasks, questions, reviews,
 merge, recovery and Stop checks across authorized clients. The owned npm package
 returned 404 at the last release check; public source/export alone is not a

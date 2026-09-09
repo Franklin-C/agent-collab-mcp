@@ -12,6 +12,13 @@ function setup(t) { const dir=mkdtempSync(join(tmpdir(),'collab-supervisor-')); 
 const response = data => new Response(JSON.stringify(data),{status:200});
 test('idle watch never starts a model',async t=>{let turns=0;const r=await supervise({...setup(t),fetch:async()=>response({next_seq:8,events:[]}),runClient:async()=>{turns++;}});assert.equal(turns,0);assert.equal(r.cursor,8);});
 
+test('an already-stopped supervisor performs no watch and dispatches no client', async t => {
+  const options = setup(t), controller = new AbortController(); controller.abort();
+  let calls = 0, turns = 0;
+  await supervise({ ...options, signal: controller.signal, fetch: async () => { calls++; return response({ next_seq: 1, events: [{ seq: 1 }] }); }, runClient: async () => { turns++; return { completed: true }; } });
+  assert.equal(calls, 0); assert.equal(turns, 0);
+});
+
 for (const reason of ['stop', 'revoked', 'lost lease']) {
   test(`saved events wait for the hub before restart: ${reason}`, async t => {
     const options = setup(t);
@@ -114,6 +121,61 @@ test('all Codex completed-turn usage survives upload failure with stable unique 
   const sent = [];
   await supervise({ ...options, model: 'gpt-test', fetch: async (url, request) => { if (url.endsWith('/report')) { sent.push(JSON.parse(request.body)); return response({}); } return response({ next_seq: 1, events: [] }); } });
   assert.deepEqual(sent, saved);
+});
+
+test('explicit resume uses fresh billing invocation IDs for each cumulative run', async t => {
+  const options = setup(t), delivered = []; let cursor = 0, turns = 0;
+  const runClient = async (_client, _prompt, args) => {
+    assert.equal(args.sessionId, turns ? 'same-native-session' : null); turns++;
+    args.onSession('same-native-session');
+    args.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: 'same-snapshot', usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } });
+    return { sessionId: 'same-native-session' };
+  };
+  const fetch = async (url, request) => {
+    if (url.endsWith('/api/usage/report')) { delivered.push(JSON.parse(request.body)); return response({}); }
+    return response({ next_seq: ++cursor, events: [{ seq: cursor }] });
+  };
+  await supervise({ ...options, resume: true, model: 'gpt-test', fetch, runClient });
+  await supervise({ ...options, resume: true, model: 'gpt-test', fetch, runClient });
+  assert.equal(delivered.length, 2); assert(delivered.every(report => report.cumulative && report.session_id !== 'same-native-session'));
+  assert.notEqual(delivered[0].session_id, delivered[1].session_id); assert.notEqual(delivered[0].event_id, delivered[1].event_id);
+});
+
+test('supervisor drains a final checkpoint after Stop with a fresh bounded delivery signal', async t => {
+  const options = setup(t), delivered = []; let polls = 0;
+  await supervise({ ...options, once: false, model: 'gpt-test', fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) {
+      assert.equal(request.signal.aborted, false); assert.equal(request.redirect, 'error');
+      delivered.push(JSON.parse(request.body)); return response({});
+    }
+    return response(++polls === 1 ? { next_seq: 1, events: [{ seq: 1 }] } : { stop_requested: true });
+  }, runClient: async (_client, _prompt, args) => {
+    await new Promise(resolve => args.signal.addEventListener('abort', resolve, { once: true }));
+    args.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: 'final-checkpoint', usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } });
+    throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+  } });
+  assert.equal(delivered.length, 1); assert.equal(delivered[0].cumulative, true);
+  assert.deepEqual(JSON.parse(readFileSync(join(options.state, 'state.json'))).usage, []);
+});
+
+test('supervisor checks Stop while a usage producer continues replenishing its outbox', { timeout: 3000 }, async t => {
+  const options = setup(t); let polls = 0, generated = 0, delivered = 0, atStop, running = false, produce;
+  await supervise({ ...options, once: false, model: 'gpt-test', fetch: async (url) => {
+    if (url.endsWith('/api/usage/report')) {
+      await new Promise(resolve => setTimeout(resolve, 5)); delivered++;
+      if (running && generated < 20) produce();
+      return response({});
+    }
+    if (++polls === 1) return response({ next_seq: 1, events: [{ seq: 1 }] });
+    atStop = delivered; return response({ stop_requested: true });
+  }, runClient: async (_client, _prompt, args) => {
+    running = true;
+    produce = () => { generated++; args.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: `snapshot-${generated}`, usage: { input_tokens: generated * 10, output_tokens: generated * 2, cached_input_tokens: generated * 5 } }); };
+    produce(); await new Promise(resolve => args.signal.addEventListener('abort', resolve, { once: true }));
+    running = false; throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+  } });
+  assert.equal(atStop, 1); assert.equal(generated, 2); assert.equal(delivered, 2);
+  assert.deepEqual(JSON.parse(readFileSync(join(options.state, 'state.json'))).usage, []);
 });
 
 test('Claude final per-query totals are counted once and include every reported model', async t => {
