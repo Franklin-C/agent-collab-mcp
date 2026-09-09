@@ -26,6 +26,13 @@ export function cleanupLocalWorktrees(options) {
   let ownedLock = borrowedLock ?? null;
   const locked = () => ownedLock ? !ownedLock.isOwned() : !!options.apply || existsSync(lock) || existsSync(join(state, 'worker.lock.guard'));
   const commonDir = realpathSync(resolve(repo, git(['rev-parse', '--git-common-dir'])));
+  const historyRewritten = () => {
+    // Local replacement objects and legacy grafts can invent ancestry that was
+    // never merged or published. Preserve all work until that ambiguity is gone.
+    const replacementBase = process.env.GIT_REPLACE_REF_BASE || 'refs/replace/';
+    if (!replacementBase.startsWith('refs/') || existsSync(join(commonDir, 'info', 'grafts')) || process.env.GIT_GRAFT_FILE && existsSync(resolve(repo, process.env.GIT_GRAFT_FILE))) return true;
+    return Boolean(git(['for-each-ref', '--format=%(refname)', 'refs/replace/', replacementBase]));
+  };
   const rows = git(['worktree', 'list', '--porcelain', '-z']).split('\0\0').filter(Boolean).map(record => Object.fromEntries(record.split('\0').filter(Boolean).map(line => { const space = line.indexOf(' '); return space < 0 ? [line, true] : [line.slice(0, space), line.slice(space + 1)]; })));
   const branches = git(['for-each-ref', '--format=%(refname:short)%09%(objectname)', 'refs/heads/workforce/']).split('\n').filter(Boolean).map(line => { const [branch, sha] = line.split('\t'); return { branch, sha }; }).filter(entry => !options.eligibleBranches || options.eligibleBranches.includes(entry.branch));
   function ancestor(sha) { try { git(['merge-base', '--is-ancestor', sha, baseSha]); return true; } catch { return false; } }
@@ -42,6 +49,7 @@ export function cleanupLocalWorktrees(options) {
     const reasons = [], tree = rows.find(row => row.branch === `refs/heads/${entry.branch}`);
     if (locked()) reasons.push('worker_lock_present');
     if (!originMatches()) reasons.push('repository_origin_changed');
+    if (historyRewritten()) reasons.push('repository_history_rewritten');
     if (options.eligibleBranches && !options.eligibleBranches.includes(entry.branch)) reasons.push('job_not_confirmed_inactive');
     if (options.activeBranches?.includes(entry.branch)) reasons.push('active_worker_branch');
     if (entry.branch === base) reasons.push('base_branch');
@@ -82,7 +90,7 @@ export function cleanupLocalWorktrees(options) {
           // Validate resolved paths immediately before Git removes a worktree.
           if (result.path) {
             const path = realpathSync(result.path);
-            if (!inside(state, path) || !inside(worktreesRoot, path) || path === repo || locked() || !originMatches()) throw new Error('Cleanup scope changed.');
+            if (!inside(state, path) || !inside(worktreesRoot, path) || path === repo || locked() || !originMatches() || historyRewritten()) throw new Error('Cleanup scope changed.');
             git(['worktree', 'remove', path]);
           }
           // Atomic expected-old-SHA deletion rejects a concurrent branch update.

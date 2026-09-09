@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { archiveHandoff, git, githubRepository, inside, readHandoffSnapshot, recoveryCheckpoint, requestWorkerApi, restoreCheckpoint, work } from '../bin/worker.mjs';
-import { executionBinding } from '../bin/client-adapters.mjs';
+import { executionBinding, runClient } from '../bin/client-adapters.mjs';
 const response = body => new Response(JSON.stringify(body), { status: 200 });
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'workforce-test-')), repo = join(root, 'repo'), state = join(root, 'state');
@@ -81,6 +82,81 @@ test('unacknowledged handoffs stay in the worktree for recovery', async t => {
   assert.equal(f.sent.filter(item => item.data.action === 'finish').length, 1, 'an uncertain success is never replaced by a failed finish');
 });
 
+test('a UTF-8 BOM handoff is acknowledged while its original bytes remain bound to the archive', async t => {
+  const f = executableFixture(t), bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(handoff))]);
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    await f.options.runClient(client, prompt, args);
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), bytes);
+  } });
+  assert.deepEqual(f.sent.find(item => item.data.action === 'finish')?.data.handoff, handoff);
+  const archive = JSON.parse(readFileSync(f.archive, 'utf8'));
+  assert.deepEqual(archive.handoff, handoff);
+  assert.equal(archive.digest, createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(existsSync(join(f.cwd, '.ehgi-handoff.json')), false);
+  writeFileSync(join(f.cwd, '.ehgi-handoff.json'), bytes);
+  const snapshot = readHandoffSnapshot(f.cwd);
+  writeFileSync(join(f.cwd, '.ehgi-handoff.json'), bytes.subarray(3));
+  assert.throws(() => archiveHandoff(f.cwd, f.state, 'bom-removed', snapshot), /changed after acknowledgement/);
+  assert.equal(existsSync(join(f.cwd, '.ehgi-handoff.json')), true);
+});
+
+test('handoff BOM tolerance does not permit a second BOM or evade the byte-size limit', t => {
+  const f = fixture(t), path = join(f.repo, '.ehgi-handoff.json'), bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  writeFileSync(path, Buffer.concat([bom, bom, Buffer.from(JSON.stringify(handoff))]));
+  assert.throws(() => readHandoffSnapshot(f.repo), SyntaxError);
+  writeFileSync(path, Buffer.concat([bom, Buffer.alloc(11998, 0x20)]));
+  assert.throws(() => readHandoffSnapshot(f.repo), /exceeds 12 KB/);
+});
+
+function blockedTaskFixture(t, reason = 'Task blocked pending new information') {
+  const f = executableFixture(t), blocked = { outcome: 'blocked', summary: 'Asked the host for the required behavior', evidence: ['Posted a question in the task thread'], nextSteps: ['Wait for the answer before continuing'] };
+  let clientReturned = false;
+  const options = { ...f.options,
+    fetch: async (url, request) => {
+      const data = JSON.parse(request.body), result = await f.options.fetch(url, request);
+      if (data.action === 'claim') {
+        const body = await result.json();
+        return response({ ...body, job: { ...body.job, kind: 'implementation', task: { id: 'coord-agent', number: 1, leaseVersion: 7, branch: 'agent/publication' } } });
+      }
+      if (data.action === 'heartbeat' && clientReturned) return response({ stop: true, reason, leaseVersion: 8 });
+      return result;
+    },
+    runClient: async (client, prompt, args) => {
+      await f.options.runClient(client, prompt, args);
+      writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(blocked));
+      clientReturned = true;
+    },
+  };
+  return { ...f, options, blocked };
+}
+
+test('a successful client preserves its blocked handoff after the hub releases the task', async t => {
+  const f = blockedTaskFixture(t); await work(f.options);
+  const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  assert.deepEqual(finish.handoff, f.blocked, 'the public blocked transition must not discard the completed client handoff');
+  assert.deepEqual(JSON.parse(readFileSync(f.archive, 'utf8')).handoff, f.blocked);
+  assert.equal(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).active, null);
+});
+
+for (const reason of ['Operator requested agent stop', 'Task lease replaced', 'Job cost limit reached']) test(`a blocked handoff cannot override ${reason}`, async t => {
+  const f = blockedTaskFixture(t, reason); await work(f.options);
+  const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  assert.equal(finish.succeeded, false);
+  assert.equal(finish.handoff, undefined);
+  assert.equal(existsSync(f.archive), false);
+  assert.deepEqual(readHandoffSnapshot(f.cwd).handoff, f.blocked);
+});
+
+test('the acknowledged block does not accept a different handoff outcome', async t => {
+  const f = blockedTaskFixture(t);
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    await f.options.runClient(client, prompt, args);
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify({ ...f.blocked, outcome: 'more_work' }));
+  } });
+  assert.equal(f.sent.find(item => item.data.action === 'finish')?.data.succeeded, false);
+  assert.equal(existsSync(f.archive), false);
+});
+
 test('worker retries safe delivery with stable usage ids and clears only acknowledged reports', async t => {
   const f = executableFixture(t), sent = [], waits = [];
   let failed = false;
@@ -99,6 +175,65 @@ test('worker retries safe delivery with stable usage ids and clears only acknowl
   assert.deepEqual(sent.map(item => item.event_id), ['worker-coord-agent-1-0', 'worker-coord-agent-1-0', 'worker-coord-agent-1-1']);
   assert.deepEqual(sent[0], sent[1]);
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
+});
+
+test('final provider usage is delivered after Stop without starting another paid turn', async t => {
+  const f = executableFixture(t), stop = new AbortController(); let turns = 0;
+  await work({ ...f.options, once: false, signal: stop.signal, runClient: async (_client, prompt, args) => {
+    turns++; assert.match(prompt, /Before the final MCP done or blocked transition, write/);
+    stop.abort();
+    args.onUsage({ type: 'turn.completed', usage: { input_tokens: 13, output_tokens: 4 } });
+    throw Object.assign(Error('cancelled'), { name: 'AbortError', retryable: false });
+  } });
+  assert.equal(turns, 1);
+  assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+  const reports = f.sent.filter(item => item.url.endsWith('/api/usage/report'));
+  assert.equal(reports.length, 1); assert.equal(reports[0].data.input_tokens, 13);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
+});
+
+test('the final usage drain is bounded and preserves undelivered reports after Stop', async t => {
+  const f = executableFixture(t), stop = new AbortController(), sent = [], originalTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 5000 ? 50 : ms, ...args));
+  await work({ ...f.options, once: false, signal: stop.signal, fetch: async (url, request) => {
+    if (!url.endsWith('/api/usage/report')) return f.options.fetch(url, request);
+    sent.push(JSON.parse(request.body));
+    await new Promise((resolve, reject) => {
+      request.signal.addEventListener('abort', () => reject(Object.assign(Error('aborted'), { name: 'AbortError' })), { once: true });
+    });
+  }, runClient: async (_client, _prompt, args) => {
+    stop.abort(); args.onUsage({ type: 'turn.completed', usage: { input_tokens: 13, output_tokens: 4 } });
+    throw Object.assign(Error('cancelled'), { name: 'AbortError', retryable: false });
+  } });
+  const saved = JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8'));
+  assert.equal(sent.length, 1); assert.deepEqual(saved.usage, sent);
+  assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+  assert.equal(existsSync(join(f.state, 'worker.lock')), false);
+});
+
+for (const mode of ['baseline', 'recovery', 'no-reports']) test(`missing ${mode} usage durably pauses paid work before another claim`, async t => {
+  const f = executableFixture(t), logs = [];
+  await work({ ...f.options, once: false, log: message => logs.push(message), runClient: async (_client, _prompt, args) => {
+    if (mode === 'baseline') throw Object.assign(Error('PRIVATE file path'), { code: 'CODEX_USAGE_UNAVAILABLE' });
+    if (mode === 'recovery') {
+      args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } });
+      throw Object.assign(Error('cancelled'), { name: 'AbortError', usageRecoveryError: 'PRIVATE diagnostic', sessionId: '0198f460-c7e7-7000-8000-000000000001' });
+    }
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(handoff));
+  } });
+  assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+  const saved = JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8'));
+  assert.equal(saved.usageAttention.jobId, 'coord-agent');
+  assert(!JSON.stringify(saved.usageAttention).includes('PRIVATE'));
+  if (mode === 'recovery') {
+    const usageIndex = f.sent.findIndex(item => item.url.endsWith('/api/usage/report'));
+    assert(usageIndex !== -1 && usageIndex < f.sent.findIndex(item => item.data.action === 'finish'));
+    assert.deepEqual(saved.usage, []);
+    assert.equal(saved.usageAttention.sessionId, '0198f460-c7e7-7000-8000-000000000001');
+    assert(!logs.join('\n').includes('PRIVATE'));
+  }
+  await assert.rejects(work({ ...f.options, fetch: async () => assert.fail('paused worker must not register or claim'), runClient: async () => assert.fail('paused worker must not launch a client') }), error => error.code === 'WORKER_USAGE_ATTENTION' && error.retryable === false);
+  assert.equal(existsSync(join(f.state, 'worker.lock')), false);
 });
 
 test('safe worker requests retry network and transient status failures with a bounded backoff', async () => {
@@ -228,4 +363,95 @@ test('wrong repository is blocked before fetch or model execution', async t => {
   const f = fixture(t); git(f.repo, ['remote', 'add', 'origin', 'https://github.com/fixture/repo.git']); let finish, turns = 0;
   await work({ host: 'http://localhost', token: 'test', repo: f.repo, state: f.state, write: true, model: 'test-model', capability: { client: 'codex', version: 'test' }, once: true, log: () => {}, fetch: async (_url, options) => { const body = JSON.parse(options.body); if (body.action === 'finish') finish = body; return response(body.action === 'claim' ? { job: { id: 'task', fence: 1 }, repository: { owner: 'other', repo: 'repository' } } : {}); }, runClient: async () => { turns++; } });
   assert.equal(turns, 0); assert.equal(finish.succeeded, false); assert.match(finish.note, /does not match/);
+});
+
+test('worker deduplicates provider replay while preserving distinct Codex turns and HTTP retry IDs', async t => {
+  const f = executableFixture(t), delivered = []; let failed = false;
+  await work({ ...f.options, wait: async () => {}, fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) {
+      delivered.push(JSON.parse(request.body));
+      if (!failed) { failed = true; return new Response('{}', { status: 503 }); }
+    }
+    return f.options.fetch(url, request);
+  }, runClient: async (_client, _prompt, args) => {
+    const report = { type: 'turn.completed', event_id: 'same-provider-turn', usage: { input_tokens: 10, output_tokens: 3 } };
+    args.onUsage(report); args.onUsage(report);
+    args.onUsage({ ...report, event_id: undefined }); args.onUsage({ ...report, event_id: undefined });
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(handoff));
+    return { completed: true };
+  } });
+  assert.deepEqual(delivered.map(report => report.event_id), ['worker-coord-agent-1-0', 'worker-coord-agent-1-0', 'worker-coord-agent-1-1', 'worker-coord-agent-1-2']);
+  assert.deepEqual(delivered[0], delivered[1], 'lost delivery acknowledgements reuse the original report');
+  assert.equal(f.sent.filter(item => item.url.endsWith('/api/usage/report')).length, 3);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
+});
+
+function finalizingChildFixture(t, { reason = 'Task completed', expire = false, restrictive } = {}) {
+  const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : 'blocked' };
+  const executable = join(f.root, 'finalizing-child.cjs');
+  writeFileSync(executable, `const {writeFileSync}=require('node:fs');
+    ${expire || restrictive ? 'setInterval(()=>{},1000);' : `setTimeout(()=>{writeFileSync('.ehgi-handoff.json',${JSON.stringify(JSON.stringify(output))});console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:3}}));},700);`}`);
+  const originalInterval = globalThis.setInterval, originalTimeout = globalThis.setTimeout;
+  let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false;
+  // Compress only worker heartbeat/grace timers; the child is a real Node
+  // process with its own real clock, filesystem handoff and structured output.
+  t.mock.method(globalThis, 'setInterval', (callback, ms, ...args) => originalInterval(callback, ms === 20000 ? 80 : ms, ...args));
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => { if (ms === 30000) graceTimers++; return originalTimeout(callback, expire && ms === 30000 ? 250 : ms, ...args); });
+  const options = { ...f.options,
+    fetch: async (url, request) => {
+      const data = JSON.parse(request.body), result = await f.options.fetch(url, request);
+      if (data.action === 'claim') {
+        const body = await result.json();
+        return response({ ...body, job: { ...body.job, kind: 'implementation', task: { id: 'coord-agent', number: 1, leaseVersion: 7, branch: 'agent/publication' } } });
+      }
+      if (data.action === 'heartbeat' && started) {
+        terminalPulses++;
+        if (restrictive && terminalPulses > 1) return typeof restrictive === 'number' ? new Response(JSON.stringify({ error: 'Execution authorization or fence changed' }), { status: restrictive }) : response({ stop: true, reason: restrictive });
+        return response({ stop: true, reason, leaseVersion: reason === 'Task completed' ? 7 : 8 });
+      }
+      return result;
+    },
+    runClient: async (_capability, prompt, args) => {
+      started = true;
+      args.signal.addEventListener('abort', () => { cancelled = true; });
+      return runClient({ client: 'codex', executable: process.execPath, prefixArgs: [executable] }, prompt, { ...args, env: { ...args.env, CODEX_HOME: join(f.root, 'empty-client-home') } });
+    },
+  };
+  return { ...f, options, output, observed: () => ({ terminalPulses, graceTimers, cancelled }) };
+}
+
+for (const reason of ['Task completed', 'Task blocked pending new information']) test(`a real child can emit its final handoff and usage after ${reason}`, async t => {
+  const f = finalizingChildFixture(t, { reason }); await work(f.options);
+  assert.deepEqual(f.sent.find(item => item.data.action === 'finish')?.data.handoff, f.output);
+  assert.ok(f.observed().terminalPulses >= 1); assert.equal(f.observed().graceTimers, 1);
+  assert.equal(f.sent.filter(item => item.url.endsWith('/api/usage/report')).length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(f.archive, 'utf8')).handoff, f.output);
+});
+
+test('repeated terminal heartbeats cannot extend a real child finalization deadline', async t => {
+  const f = finalizingChildFixture(t, { expire: true }); await work(f.options);
+  assert.ok(f.observed().terminalPulses >= 2); assert.equal(f.observed().graceTimers, 1); assert.equal(f.observed().cancelled, true);
+  const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  assert.equal(finish.succeeded, false); assert.match(finish.note, /30-second grace period/); assert.equal(existsSync(f.archive), false);
+});
+
+for (const restrictive of ['Operator requested agent stop', 'Job cost limit reached', 401, 409]) test(`finalization grace immediately yields to ${restrictive}`, async t => {
+  const f = finalizingChildFixture(t, { restrictive }); await work(f.options);
+  assert.equal(f.observed().graceTimers, 1); assert.equal(f.observed().cancelled, true);
+  const finish = f.sent.find(item => item.data.action === 'finish')?.data;
+  assert.equal(finish.succeeded, false); assert.equal(finish.handoff, undefined); assert.equal(existsSync(f.archive), false);
+  assert.equal(finish.note, typeof restrictive === 'number' ? 'Execution authorization or fence changed' : restrictive);
+});
+
+test('a restrictive hub stop preserves the independent missing-usage pause across restart', async t => {
+  const f = finalizingChildFixture(t, { restrictive: 'Operator requested agent stop' });
+  await work({ ...f.options, once: false, runClient: async (...args) => {
+    try { return await f.options.runClient(...args); }
+    catch (error) { throw Object.assign(error, { usageRecoveryError: 'PRIVATE checkpoint diagnostic' }); }
+  } });
+  assert.equal(f.sent.find(item => item.data.action === 'finish')?.data.note, 'Operator requested agent stop');
+  assert.equal(f.sent.filter(item => item.data.action === 'claim').length, 1);
+  const saved = JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8'));
+  assert.equal(saved.usageAttention.jobId, 'coord-agent'); assert(!JSON.stringify(saved).includes('PRIVATE'));
+  await assert.rejects(work({ ...f.options, fetch: async () => assert.fail('hub stop must not hide a durable usage pause') }), error => error.code === 'WORKER_USAGE_ATTENTION');
 });

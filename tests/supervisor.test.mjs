@@ -66,6 +66,24 @@ test('MCP approval denial pauses immediately and retains events across restart',
   assert.equal(resolved.pauseReason, undefined);
 });
 
+for (const unavailable of [{ usageRecoveryError: 'Exact-session recovery unavailable.' }, { code: 'CODEX_USAGE_UNAVAILABLE' }]) {
+  test(`missing provider accounting pauses across restart and --retry-failed: ${Object.keys(unavailable)[0]}`, async t => {
+    const options = setup(t); let turns = 0;
+    await supervise({ ...options, fetch: async () => response({ next_seq: 1, events: [{ seq: 1 }] }), runClient: async () => {
+      turns++; throw Object.assign(new Error('Provider interruption'), { ...unavailable, sessionId: 'exact-session' });
+    } });
+    const saved = JSON.parse(readFileSync(join(options.state, 'state.json')));
+    assert.equal(saved.pending.length, 1); assert.equal(saved.failures, 3);
+    assert.equal(saved.pauseReason, 'provider_usage_unavailable'); assert.equal(saved.usageAttention.sessionId, 'exact-session');
+    for (const retryFailed of [false, true]) await assert.rejects(supervise({ ...options, retryFailed,
+      fetch: async () => { throw new Error('Paused supervisor must not poll for more paid work'); },
+      runClient: async () => { turns++; },
+    }), error => error.code === 'SUPERVISOR_USAGE_ATTENTION' && error.retryable === false);
+    assert.equal(turns, 1);
+    assert.deepEqual(JSON.parse(readFileSync(join(options.state, 'state.json'))).usageAttention, saved.usageAttention);
+  });
+}
+
 test('a completed Codex turn cannot acknowledge a structured MCP approval failure', async t => {
   const options = setup(t);
   const denied = { type: 'item.completed', item: { type: 'mcp_tool_call', server: 'agent-collab', tool: 'get_briefing', status: 'failed', error: { message: 'MCP tool call requires approval, but approval policy is never' } } };
@@ -120,4 +138,27 @@ test('usage requires real input/output totals and model attribution',()=>{
   assert.deepEqual(usageReports('claude-code',{type:'result',modelUsage:{model:{inputTokens:3}}}),[]);
   assert.deepEqual(usageReports('gemini-cli',{type:'result',stats:{input_tokens:-1,output_tokens:1}},'gemini-test'),[]);
   assert.equal(usageReports('codex',{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}},'gpt-test')[0].input_tokens,0);
+});
+
+test('an already-cancelled client turn never spawns or reports a started run', async () => {
+  for (const client of ['codex', 'claude-code', 'gemini-cli']) {
+    const controller = new AbortController(); controller.abort();
+    let spawns = 0; const activity = [];
+    await assert.rejects(runClient({ client, executable: process.execPath }, 'cancelled fixture', {
+      signal: controller.signal,
+      spawn: () => { spawns++; throw new Error('Cancelled work reached process creation'); },
+      onActivity: event => activity.push(event),
+    }), error => error.name === 'AbortError' && error.retryable === false);
+    assert.equal(spawns, 0); assert.deepEqual(activity, []);
+  }
+});
+
+test('cancelling a real client reports cancellation rather than a provider error', async t => {
+  const options = setup(t), executable = join(options.cwd, 'cancelled-client.cjs'), controller = new AbortController(), activity = [];
+  writeFileSync(executable, 'console.log("client ready");setInterval(()=>{},1000);');
+  await assert.rejects(runClient({ client: 'codex', executable: process.execPath, prefixArgs: [executable] }, 'fixture', {
+    cwd: options.cwd, signal: controller.signal, timeoutMs: 3000,
+    onOutput: () => controller.abort(), onActivity: event => activity.push(event.kind),
+  }), error => error.name === 'AbortError' && error.retryable === false && /cancelled/.test(error.message) && !/provider error/.test(error.message));
+  assert.ok(activity.includes('run_stopped')); assert.ok(!activity.includes('run_failed'));
 });

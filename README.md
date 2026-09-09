@@ -118,6 +118,19 @@ reviews in merge requests, put suggestions in Improve and record discoveries in
 memory. Acknowledged handoffs are archived locally; MCP task/review updates and
 acceptance evidence remain authoritative.
 
+Assignment prompts ask agents to read `get_inbox`, use relevant thread context,
+and acknowledge only handled items through their returned inbox IDs in
+`ack_ids`, including answers used when recovering work. Unread, unhandled and
+new items remain untouched; the worker never acknowledges the inbox itself.
+This is explicit model guidance, not a guarantee of every client's compliance.
+
+Save `.ehgi-handoff.json` before the final MCP `done` or `blocked` transition,
+then end promptly after MCP confirms it. A running client gets one fixed
+30-second finalization period after the hub acknowledges normal task completion
+or its own blocked transition, allowing the handoff and final usage to settle.
+Repeated heartbeats cannot extend it. Operator Stop, revoked authorization,
+stale fences and budget limits still cancel execution immediately when observed.
+
 The worker renews fenced leases, persists bounded recovery checkpoints and
 provider usage, and reports blockers. Independent workers can run concurrently.
 Idle polling makes no model calls. A `more_work` handoff can continue within its
@@ -241,6 +254,19 @@ context unless an assignment needs it; reading updates still consumes tokens.
 Usage is reported when the client emits it, often at turn completion. Missing
 totals are not guessed. Stable usage event IDs prevent duplicate accounting on
 retry, and reporting failures never justify repeating completed coding work.
+When a Codex invocation is interrupted, the adapter reads only that invocation's
+exact session checkpoint and reports provider token totals absent from its
+structured output. It never substitutes estimates or attributes another
+session's counters. A stopped worker gives pending usage one bounded five-second
+delivery window after its child exits; failed deliveries stay in local state.
+
+Missing or ambiguous checkpoint usage persistently pauses further paid work in
+the worker's local `usageAttention` record. Restarting, resetting startup
+recovery or re-enrolling does not clear it. An operator must reconcile the
+retained session's actual usage before clearing that record. Checkpoint recovery
+runs on invocation exit: cost visibility during a long active turn still depends
+on the client's emitted reports and may be delayed.
+
 Supervisor `--phase implementation|review|coordination` is optional; use it only
 when the phase is known. Worker assignments supply their own phase.
 
