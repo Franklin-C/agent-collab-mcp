@@ -386,10 +386,64 @@ test('worker deduplicates provider replay while preserving distinct Codex turns 
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
 });
 
+test('live cumulative usage is delivered before a serialized budget pulse can stop the client', { timeout: 5000 }, async t => {
+  const f = executableFixture(t), delivered = []; let active = 0, peak = 0, clientRunning = false, stoppedWhileRunning = false;
+  await work({ ...f.options, fetch: async (url, request) => {
+    const packet = JSON.parse(request.body);
+    if (url.endsWith('/api/usage/report')) {
+      active++; peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      delivered.push(packet); active--;
+    }
+    if (packet.action === 'heartbeat' && clientRunning) {
+      assert.equal(active, 0); assert.equal(delivered.length, 1);
+      return response({ stop: true, reason: 'Job cost limit reached' });
+    }
+    return f.options.fetch(url, request);
+  }, runClient: async (_client, _prompt, args) => {
+    clientRunning = true;
+    const event = { type: 'ehgi.codex_usage_snapshot', event_id: 'first', usage: { input_tokens: 10, output_tokens: 3, cached_input_tokens: 5 } };
+    args.onUsage(event); args.onUsage(event);
+    args.onUsage({ ...event, event_id: 'second', usage: { input_tokens: 20, output_tokens: 6, cached_input_tokens: 10 } });
+    await new Promise(resolve => args.signal.addEventListener('abort', resolve, { once: true }));
+    stoppedWhileRunning = true; clientRunning = false;
+    throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+  } });
+  assert.equal(stoppedWhileRunning, true); assert.equal(peak, 1);
+  assert.deepEqual(delivered.map(report => [report.cumulative, report.input_tokens, report.session_id]), [[true, 10, 'worker-coord-agent-1'], [true, 20, 'worker-coord-agent-1']]);
+  assert.equal(new Set(delivered.map(report => report.event_id)).size, 2);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'))).usage, []);
+});
+
+test('a continuing usage producer cannot postpone authority Stop until the outbox empties', { timeout: 5000 }, async t => {
+  const f = executableFixture(t); let produce, running = false, generated = 0, delivered = 0, deliveredAtStop;
+  await work({ ...f.options, fetch: async (url, request) => {
+    const packet = JSON.parse(request.body);
+    if (url.endsWith('/api/usage/report')) {
+      await new Promise(resolve => setTimeout(resolve, 5)); delivered++;
+      if (running && generated < 20) produce();
+    }
+    if (packet.action === 'heartbeat' && running) {
+      deliveredAtStop = delivered;
+      assert(JSON.parse(readFileSync(join(f.state, 'state.json'))).usage.length > 0, 'producer still has pending accounting when authority is checked');
+      return response({ stop: true, reason: 'Operator requested agent stop' });
+    }
+    return f.options.fetch(url, request);
+  }, runClient: async (_client, _prompt, args) => {
+    running = true;
+    produce = () => { generated++; args.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: `snapshot-${generated}`, usage: { input_tokens: generated * 10, output_tokens: generated * 2, cached_input_tokens: generated * 5 } }); };
+    produce(); await new Promise(resolve => args.signal.addEventListener('abort', resolve, { once: true }));
+    running = false; throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+  } });
+  assert.equal(deliveredAtStop, 1); assert.equal(generated, 2); assert.equal(delivered, generated);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'))).usage, []);
+});
+
 function finalizingChildFixture(t, { reason = 'Task completed', expire = false, restrictive } = {}) {
   const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : 'blocked' };
   const executable = join(f.root, 'finalizing-child.cjs');
   writeFileSync(executable, `const {writeFileSync}=require('node:fs');
+    console.log(JSON.stringify({type:'thread.started',thread_id:'01a08354-4c9d-7c90-becb-39b58bc8ca35'}));
     ${expire || restrictive ? 'setInterval(()=>{},1000);' : `setTimeout(()=>{writeFileSync('.ehgi-handoff.json',${JSON.stringify(JSON.stringify(output))});console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:3}}));},700);`}`);
   const originalInterval = globalThis.setInterval, originalTimeout = globalThis.setTimeout;
   let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false;

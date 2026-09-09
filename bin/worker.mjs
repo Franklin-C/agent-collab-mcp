@@ -153,11 +153,11 @@ export async function work(options) {
     } catch (error) { log(`Local housekeeping deferred: ${error.message}`); if (error.code === 'REPOSITORY_CHANGED') stop(); }
   };
   let flushing, flushController;
-  const flush = (signal = shutdown.signal) => {
+  const flush = (signal = shutdown.signal, limit = Infinity) => {
     if (flushing) return flushing;
     flushController = new AbortController();
     const usageSignal = AbortSignal.any([signal, flushController.signal]);
-    return flushing = (async () => { while (state.usage.length) {
+    return flushing = (async () => { for (let sent = 0; state.usage.length && sent < limit; sent++) {
       await requestWorkerApi({ host: options.host, token, fetch: options.fetch, signal: usageSignal, wait: options.wait }, '/api/usage/report', state.usage[0]);
       state.usage.shift(); persist();
     } })().finally(() => { flushing = null; flushController = null; });
@@ -199,12 +199,14 @@ export async function work(options) {
       const observation = event => activity.record(event, { runId, ...(taskId ? { taskId } : {}) });
       const controller = new AbortController(), abort = () => controller.abort();
       shutdown.signal.addEventListener('abort', abort, { once: true });
-      let heartbeat = Promise.resolve(), interval, cwd, baseSha, reports = 0, failure = null, finishAttempted = false;
+      let heartbeat = Promise.resolve(), interval, cwd, baseSha, reports = 0, failure = null, finishAttempted = false, pulseQueued = false;
       let clientRunning = false, finalizationStarted = false, finalizationTimer, finalizationDeadline = null;
       const fail = error => { if (!failure || failure.normalTerminal) failure = error; controller.abort(); };
       const expireFinalization = () => fail(Object.assign(new Error('Client finalization exceeded the 30-second grace period.'), { code: 'CLIENT_FINALIZATION_TIMEOUT' }));
       const pulse = async () => {
-        await flush();
+        // A continuing producer must not starve authority checks. Pre-claim
+        // and post-client drains keep their separate accounting guarantees.
+        await flush(shutdown.signal, 1);
         const checkpoint = cwd && baseSha && taskId ? recoveryCheckpoint(cwd, baseSha, directory) : undefined;
         const result = await packet({ action: 'heartbeat', jobId: job.id, fence: job.fence, ...(checkpoint ? { checkpoint } : {}) });
         if (result.stop) {
@@ -225,11 +227,20 @@ export async function work(options) {
           } else fail(new Error(result.reason ?? 'Worker stopped by hub.'));
         }
       };
+      const queuePulse = () => {
+        if (pulseQueued || controller.signal.aborted) return;
+        pulseQueued = true;
+        heartbeat = heartbeat.then(async () => {
+          pulseQueued = false;
+          if (!controller.signal.aborted) await pulse();
+          if (clientRunning && state.usage.length) queuePulse();
+        }).catch(fail);
+      };
       try {
         if (!safeId(job.id) || !Number.isSafeInteger(job.fence) || job.fence < 1 || !repository || remote !== `${repository.owner}/${repository.repo}`.toLowerCase()) throw new Error('Job repository or identity does not match the approved local origin.');
         await pulse(); if (failure) throw failure;
         // Continue renewing while fetch and client execution run. Never accept work after losing the lease.
-        interval = setInterval(() => { heartbeat = heartbeat.then(pulse).catch(fail); }, 20000);
+        interval = setInterval(queuePulse, 20000);
         assertRepositoryOrigin(repo, remote, runGit);
         runGit(repo, ['fetch', 'origin']);
         await pulse(); if (failure) throw failure;
@@ -257,7 +268,13 @@ export async function work(options) {
           onActivity: observation,
           // Coordination reservations use the durable job id; attributing usage
           // to that same key lets the service consume the reserved allocation.
-          onUsage: raw => { for (const report of collectUsage(raw)) { state.usage.push({ ...report, source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); } },
+          onUsage: raw => {
+            const batch = collectUsage(raw);
+            for (const report of batch) { state.usage.push({ ...report, source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); }
+            // Deliver passive counts, then evaluate the budget promptly on the
+            // same serialized heartbeat chain used for lease renewal and Stop.
+            if (batch.length) queuePulse();
+          },
         }); } finally {
           clientRunning = false;
           if (finalizationDeadline !== null && performance.now() >= finalizationDeadline) expireFinalization();

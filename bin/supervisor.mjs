@@ -24,8 +24,9 @@ export async function supervise(options) {
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop); process.once('SIGTERM', stop); options.signal?.addEventListener('abort', stop, { once: true });
+  if (options.signal?.aborted) stop();
   let worker = null;
-  let activity;
+  let activity, flushUsage;
   try {
     activity = createActivityReporter({ statePath: join(directory, 'activity.json'), server: options.host, token, fetch: options.fetch });
     const identity = createHash('sha256').update(`${options.host}:${token}:${capability.client}:${cwd}:${Boolean(options.write)}`).digest('hex');
@@ -36,15 +37,17 @@ export async function supervise(options) {
     if (options.retryFailed) { state.failures = 0; delete state.pauseReason; }
     const persist = () => { const temp = `${statePath}.${process.pid}.tmp`; writeFileSync(temp, JSON.stringify(state), { mode: 0o600 }); renameSync(temp, statePath); };
     const log = options.log ?? (message => console.error(message));
-    const flushUsage = async () => {
-      for (const report of state.usage.slice(0, 20)) {
+    let flushing;
+    flushUsage = (signal = controller.signal, limit = 1) => flushing ??= (async () => {
+      for (let sent = 0; state.usage.length && sent < limit && !signal.aborted; sent++) {
+        const report = state.usage[0];
         try {
-          const response = await (options.fetch ?? fetch)(`${options.host}/api/usage/report`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]), body: JSON.stringify(report) });
+          const response = await (options.fetch ?? fetch)(`${options.host}/api/usage/report`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]), redirect: 'error', body: JSON.stringify(report) });
           if (!response.ok) break;
           state.usage.shift(); persist();
         } catch { break; }
       }
-    };
+    })().finally(() => { flushing = null; });
     const launch = () => {
       if (worker || !state.pending.length || state.failures >= 3 || controller.signal.aborted) return;
       const batch = state.pending.slice(0, 32);
@@ -60,8 +63,9 @@ export async function supervise(options) {
         onUsage: event => {
           const reports = collectUsage(event);
           if (!reports.length) return;
-          state.usage.push(...reports.map(report => ({ ...report, event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: state.sessionId ?? turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
+          state.usage.push(...reports.map(report => ({ ...report, event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
           persist();
+          void flushUsage();
         },
         onSession: sessionId => { if (sessionId && state.sessionId !== sessionId) { state.sessionId = sessionId; persist(); } },
       }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log('Client turn completed.'); })
@@ -111,6 +115,10 @@ export async function supervise(options) {
     return { cursor: state.cursor, pending: state.pending.length, failures: state.failures, directory };
   } finally {
     stop(); if (worker) await worker;
+    // Child close can add a final checkpoint after Stop. Drain passively with
+    // a separate bounded signal, retaining every unacknowledged event id.
+    await flushUsage?.();
+    await flushUsage?.(AbortSignal.timeout(5000), Infinity);
     await activity?.close().catch(() => {});
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); options.signal?.removeEventListener('abort', stop); unlinkSync(lock);
   }

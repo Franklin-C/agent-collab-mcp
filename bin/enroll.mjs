@@ -47,18 +47,24 @@ export async function enroll(options) {
   if (existsSync(join(cwd, proofName))) throw new Error('Enrollment proof file already exists.');
   let reportIndex = 0;
   const collectUsage = createUsageCollector(capability.client, options.model);
-  const flushUsage = async () => {
+  let flushing, flushController;
+  const flushUsage = signal => {
+    if (flushing) return flushing;
+    flushController = new AbortController();
+    return flushing = (async () => {
     while (state.usage.length) {
-      const response = await (options.fetch ?? fetch)(`${options.host}/api/usage/report`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(state.usage[0]), redirect: 'error', signal: AbortSignal.timeout(10000) });
+      const response = await (options.fetch ?? fetch)(`${options.host}/api/usage/report`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(state.usage[0]), redirect: 'error', signal: AbortSignal.any([flushController.signal, ...(signal ? [signal] : []), AbortSignal.timeout(10000)]) });
       if (!response.ok) throw new Error('Enrollment usage delivery failed; usage retained for the worker to retry.');
       state.usage.shift(); persist();
     }
+    })().finally(() => { flushing = null; flushController = null; });
   };
   try {
     const prompt = `This is an operator-authorized EhGI enrollment verification in a temporary Git worktree. Read AGENTS.md if present. Call get_briefing through the configured EhGI MCP server and obey stop_requested. Then call workforce_action with action "enrollment_verify" and input ${JSON.stringify({ workerId: state.workerId, challenge: challenge.challenge })}. Write exactly ${JSON.stringify(proof)} into ${proofName} using your file-edit tool, then read it back. Do not edit other files, claim tasks, open PRs, or change client permissions. Report any missing tools or approval requirement honestly and stop.`;
     lock.setPhase('client_active');
     try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, profile: options.profile, model: options.model, write: true, timeoutMs: 180000, signal: options.signal, onActivity: event => activity.record(event, { runId }), onUsage: raw => {
       for (const report of collectUsage(raw)) state.usage.push({ ...report, event_id: `${runId}-${reportIndex++}`, session_id: runId, phase: 'coordination', source: 'cli_stream' }); persist();
+      void flushUsage().catch(() => {}); // Durable outbox retains failed deliveries.
     } }); } finally { lock.setPhase('idle'); }
     const proofPath = join(cwd, proofName);
     if (!existsSync(proofPath) || !lstatSync(proofPath).isFile() || lstatSync(proofPath).isSymbolicLink() || readFileSync(proofPath, 'utf8').trim() !== proof) throw new Error('The actual client did not complete its local file-edit probe.');
@@ -74,7 +80,12 @@ export async function enroll(options) {
     }
     throw error;
   } finally {
-    await flushUsage().catch(() => {});
+    const deadline = new AbortController();
+    const timer = setTimeout(() => { deadline.abort(); flushController?.abort(); }, 5000);
+    try {
+      if (flushing) await flushing.catch(() => {});
+      if (!deadline.signal.aborted) await flushUsage(deadline.signal).catch(() => {});
+    } finally { clearTimeout(timer); }
     await activity.close().catch(() => {});
     // Retain the detached probe worktree as evidence; cleanup requires its own explicit action.
   }

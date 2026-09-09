@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { clientActivity, clientUsageActivity } from './activity.mjs';
 import { codexConfigurationBinding, codexProfileName } from './codex-config.mjs';
-import { createCodexUsageRecovery } from './codex-usage.mjs';
+import { createCodexUsageNormalizer } from './codex-usage.mjs';
 
 export const CLIENTS = {
   codex: { executable: 'codex', documentation: 'https://learn.chatgpt.com/docs/non-interactive-mode' },
@@ -126,11 +126,16 @@ export function readClientDiagnostic(client, text) {
 export async function runClient(capability, prompt, options = {}) {
   if (options.signal?.aborted) throw Object.assign(new Error('Client turn was cancelled before execution.'), { name: 'AbortError', retryable: false });
   const call = invocation(capability, options.sessionId, options);
-  const usageRecovery = capability.client === 'codex' && options.onUsage ? createCodexUsageRecovery({ sessionId: options.sessionId, cwd: options.cwd ?? process.cwd(), env: options.env ?? process.env }) : null;
+  const activity = event => { try { options.onActivity?.(event); } catch { /* Observation must never change execution results. */ } };
+  const usage = capability.client === 'codex' && options.onUsage ? await createCodexUsageNormalizer({ sessionId: options.sessionId, cwd: options.cwd ?? process.cwd(), env: options.env ?? process.env, signal: options.signal, readTimeoutMs: options.usageReadTimeoutMs,
+    onUsage: async event => { await options.onUsage(event); for (const item of clientUsageActivity('codex', event)) activity(item); },
+  }) : null;
+  // A resume baseline is asynchronous; Stop may arrive while it is being read.
+  if (options.signal?.aborted) throw Object.assign(new Error('Client turn was cancelled before execution.'), { name: 'AbortError', retryable: false });
   return await new Promise((resolve, reject) => {
     const child = (options.spawn ?? spawn)(call.command, call.args, { cwd: options.cwd, env: options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
     let buffer = '', diagnosticBuffer = '', sessionId = options.sessionId ?? null, failed = false, requiresApproval = false, requiresAuthentication = false, authenticationHint = false, completed = false, bytes = 0, settled = false;
-    const activity = event => { try { options.onActivity?.(event); } catch { /* Observation must never change execution results. */ } };
+    let usageRecoveryError, sampleTimer, samplePending = false;
     activity({ kind: 'run_started' });
     const killTree = signal => {
       if (!child.pid || settled) return;
@@ -140,6 +145,19 @@ export async function runClient(capability, prompt, options = {}) {
       } else { try { process.kill(-child.pid, signal); } catch { child.kill(signal); } }
     };
     const stop = () => { failed = true; killTree('SIGTERM'); setTimeout(() => killTree('SIGKILL'), 5000).unref(); };
+    const usageFailed = () => {
+      usageRecoveryError = 'Exact-session provider usage reconciliation was unavailable; no token estimate was substituted.';
+      clearInterval(sampleTimer); if (!settled) stop();
+    };
+    if (usage) {
+      // At most one outstanding sample, including slow reads. No queued timer backlog.
+      sampleTimer = setInterval(() => {
+        if (samplePending || settled) return;
+        samplePending = true;
+        usage.sample().catch(usageFailed).finally(() => { samplePending = false; });
+      }, options.usagePollMs ?? 5000);
+      sampleTimer.unref();
+    }
     const timer = setTimeout(() => { failed = true; stop(); }, options.timeoutMs ?? 15 * 60000); timer.unref();
     options.signal?.addEventListener('abort', stop, { once: true });
     const consume = (line) => {
@@ -147,12 +165,14 @@ export async function runClient(capability, prompt, options = {}) {
       requiresApproval ||= parsed.requiresApproval === true;
       requiresAuthentication ||= parsed.requiresAuthentication === true;
       authenticationHint ||= parsed.authenticationHint === true;
-      try {
-        const raw = JSON.parse(line);
-        usageRecovery?.observe(raw);
-        try { options.onUsage?.(raw); } catch { /* A failed usage sink does not hide passive observations. */ }
-        for (const event of [...clientActivity(capability.client, raw), ...clientUsageActivity(capability.client, raw)]) activity(event);
-      } catch { /* Non-JSON diagnostics are not usage or activity. */ } sessionId = parsed.sessionId ?? sessionId; failed ||= parsed.failed; completed ||= parsed.completed;
+      let raw;
+      try { raw = JSON.parse(line); } catch { /* Non-JSON diagnostics are not usage or activity. */ }
+      if (raw) {
+        if (usage) usage.observe(raw).catch(usageFailed);
+        else { try { options.onUsage?.(raw); } catch { usageFailed(); } }
+        for (const event of [...clientActivity(capability.client, raw), ...(usage ? [] : clientUsageActivity(capability.client, raw))]) activity(event);
+      }
+      sessionId = parsed.sessionId ?? sessionId; failed ||= parsed.failed; completed ||= parsed.completed;
       options.onSession?.(sessionId);
     };
     child.stdout.on('data', chunk => {
@@ -169,25 +189,21 @@ export async function runClient(capability, prompt, options = {}) {
       authenticationHint ||= parsed.authenticationHint;
       requiresApproval ||= parsed.requiresApproval;
     });
-    child.on('error', error => { settled = true; clearTimeout(timer); options.signal?.removeEventListener('abort', stop); activity({ kind: 'run_failed' }); reject(error); });
-    child.on('close', (code, signal) => {
-      const alreadyFailed = settled;
-      settled = true; clearTimeout(timer); options.signal?.removeEventListener('abort', stop);
+    let spawnError;
+    child.on('error', error => { spawnError = error; failed = true; });
+    child.on('close', async (code, signal) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); clearInterval(sampleTimer); options.signal?.removeEventListener('abort', stop);
       if (buffer) consume(buffer);
-      let usageRecoveryError;
-      if (!alreadyFailed && usageRecovery && (code !== 0 || failed || !completed || requiresApproval || requiresAuthentication || options.signal?.aborted)) {
-        try {
-          const recovered = usageRecovery.recover();
-          if (recovered) {
-            options.onUsage(recovered);
-            for (const event of clientUsageActivity(capability.client, recovered)) activity(event);
-          }
-        } catch { usageRecoveryError = 'Exact-session provider usage recovery was unavailable; no token estimate was substituted.'; }
-      }
+      // The normalizer waits for queued stdout and any in-flight sample, then
+      // reads once more after close. Stop never discards already-paid counters.
+      if (usage) await usage.finish({ completed: code === 0 && !failed && completed && !requiresApproval && !requiresAuthentication && !options.signal?.aborted }).catch(usageFailed);
       requiresAuthentication ||= authenticationHint && (capability.client === 'gemini-cli' ? code === 41 : capability.client === 'claude-code' && typeof code === 'number' && code !== 0);
-      failed ||= requiresApproval || requiresAuthentication;
-      if (!alreadyFailed) activity({ kind: options.signal?.aborted ? 'run_stopped' : requiresAuthentication ? 'needs_authentication' : requiresApproval ? 'needs_permission' : code !== 0 || failed || !completed ? 'run_failed' : 'run_finished' });
+      failed ||= requiresApproval || requiresAuthentication || Boolean(usageRecoveryError);
+      activity({ kind: options.signal?.aborted ? 'run_stopped' : requiresAuthentication ? 'needs_authentication' : requiresApproval ? 'needs_permission' : code !== 0 || failed || !completed ? 'run_failed' : 'run_finished' });
       if (options.signal?.aborted) reject(Object.assign(new Error(`${capability.client} turn was cancelled. Events remain pending.`), { name: 'AbortError', retryable: false, sessionId, requiresApproval, requiresAuthentication, ...(usageRecoveryError ? { usageRecoveryError } : {}) }));
+      else if (usageRecoveryError) reject(Object.assign(new Error(usageRecoveryError), { code: 'CODEX_USAGE_UNAVAILABLE', retryable: false, usageRecoveryError, sessionId, requiresApproval, requiresAuthentication }));
+      else if (spawnError) reject(spawnError);
       else if (code !== 0 || failed || !completed) reject(Object.assign(new Error(requiresAuthentication ? `${capability.client} requires sign-in before unattended work can continue. ${capability.client === 'claude-code' ? 'Open Claude Code and run /login' : 'Configure authentication in Gemini CLI'}, then rerun enrollment. Events remain pending.` : requiresApproval ? `${capability.client} requires approval for its configured tools before unattended work can continue. Resolve the denied permission in the client, then rerun enrollment. Events remain pending.` : `${capability.client} turn did not complete (${signal ?? code}${failed ? ', provider error' : ''}). Events remain pending.`), { sessionId, requiresApproval, requiresAuthentication, ...(usageRecoveryError ? { usageRecoveryError } : {}) }));
       else resolve({ sessionId, completed, bytes });
     });
