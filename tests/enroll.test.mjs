@@ -82,6 +82,36 @@ test('client proof without measurable usage cannot mark a worker ready', async t
     writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1])); return { completed: true };
   } }), /no measurable usage/);
   assert.equal(verified, false);
+  assert.match(JSON.parse(readFileSync(join(options.state, 'state.json'))).usageAttention.reason, /no estimate/);
+});
+
+test('missing enrollment accounting remains paused before any repeat HTTP or paid probe', async t => {
+  const options = fixture(t); let turns = 0;
+  await assert.rejects(enroll({ ...options, runClient: async () => {
+    turns++; throw Object.assign(new Error('Cancelled'), { usageRecoveryError: 'Unavailable', sessionId: 'exact-session' });
+  } }), /Cancelled/);
+  const attention = JSON.parse(readFileSync(join(options.state, 'state.json'))).usageAttention;
+  assert.equal(attention.sessionId, 'exact-session'); assert.match(attention.reason, /no estimate/);
+  await assert.rejects(enroll({ ...options,
+    fetch: async () => { throw new Error('Paused enrollment must not contact the hub'); },
+    runClient: async () => { turns++; },
+  }), error => error.code === 'WORKER_USAGE_ATTENTION' && error.retryable === false);
+  assert.equal(turns, 1);
+  assert.deepEqual(JSON.parse(readFileSync(join(options.state, 'state.json'))).usageAttention, attention);
+});
+
+test('enrollment deduplicates repeated provider results while preserving every model report', async t => {
+  const options = fixture(t), uploaded = [];
+  await enroll({ ...options, capability: { client: 'claude-code', compatible: true, version: 'fixture' }, fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) uploaded.push(JSON.parse(request.body));
+    return options.fetch(url, request);
+  }, runClient: async (_client, prompt, run) => {
+    writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
+    const event = { type: 'result', uuid: 'same-provider-result', modelUsage: { first: { inputTokens: 10, outputTokens: 2 }, second: { inputTokens: 4, outputTokens: 1 } } };
+    run.onUsage(event); run.onUsage(event); return { completed: true };
+  } });
+  assert.equal(uploaded.length, 2); assert.equal(new Set(uploaded.map(report => report.event_id)).size, 2);
+  assert.equal(uploaded.reduce((total, report) => total + report.input_tokens, 0), 14);
 });
 test('handoff validation rejects missing, fabricated shape and excessive evidence', t => {
   const f = fixture(t); assert.throws(() => readHandoff(f.repo), /no .ehgi-handoff/);

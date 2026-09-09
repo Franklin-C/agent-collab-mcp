@@ -56,6 +56,33 @@ test('preserves unpublished commits with no age-based exceptions', t => {
   execFileSync('git', ['add', '.'], { cwd: f.tree, windowsHide: true }); execFileSync('git', ['commit', '-m', 'unpublished'], { cwd: f.tree, windowsHide: true });
   assert.ok(cleanupLocalWorktrees({ ...f, apply: true }).branches[0].reasons.includes('merge_not_verified')); assert.ok(existsSync(f.tree));
 });
+
+for (const rewrite of ['replace', 'custom-replace', 'graft']) test(`retains unmerged work when local ${rewrite} history makes it appear merged`, t => {
+  const f = fixture(t);
+  const treeGit = args => execFileSync('git', args, { cwd: f.tree, encoding: 'utf8', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  writeFileSync(join(f.tree, 'feature.txt'), 'unmerged feature'); treeGit(['add', '.']); treeGit(['commit', '-m', 'unmerged feature']);
+  const head = treeGit(['rev-parse', 'HEAD']);
+  writeFileSync(join(f.repo, 'main.txt'), 'independent main work'); f.git(['add', '.']); f.git(['commit', '-m', 'main work']);
+  const base = f.git(['rev-parse', 'HEAD']);
+  assert.throws(() => f.git(['merge-base', '--is-ancestor', head, base]), error => error.status === 1);
+  if (rewrite === 'custom-replace') {
+    const original = process.env.GIT_REPLACE_REF_BASE;
+    process.env.GIT_REPLACE_REF_BASE = 'refs/test-replacements/';
+    t.after(() => { if (original === undefined) delete process.env.GIT_REPLACE_REF_BASE; else process.env.GIT_REPLACE_REF_BASE = original; });
+  }
+  if (rewrite !== 'graft') {
+    const replacement = f.git(['commit-tree', `${base}^{tree}`, '-p', head, '-m', 'virtual ancestry']);
+    f.git(['replace', base, replacement]);
+  } else writeFileSync(join(f.repo, '.git', 'info', 'grafts'), `${base} ${head}\n`);
+  assert.equal(f.git(['merge-base', '--is-ancestor', head, base]), '', 'local rewriting hides the true ancestry');
+  for (const apply of [false, true]) {
+    const result = cleanupLocalWorktrees({ ...f, apply });
+    assert.equal(result.branches[0].state, 'retained');
+    assert.ok(result.branches[0].reasons.includes('repository_history_rewritten'));
+    assert.equal(readFileSync(join(f.tree, 'feature.txt'), 'utf8'), 'unmerged feature');
+    assert.equal(f.git(['rev-parse', 'refs/heads/workforce/task-1']), head);
+  }
+});
 test('never removes a worktree outside the explicitly selected worker directory', t => {
   const f = fixture(t), other = join(f.repo, 'other-worker'); mkdirSync(join(other, 'worktrees'), { recursive: true });
   assert.ok(cleanupLocalWorktrees({ repo: f.repo, state: other, apply: true }).branches[0].reasons.includes('outside_managed_worktrees')); assert.ok(existsSync(f.tree));

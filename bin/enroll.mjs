@@ -6,7 +6,7 @@ import { realpathSync } from 'node:fs';
 import { git, githubRepository, inside } from './worker.mjs';
 import { capabilityContract, executionBinding, inspectClient, runClient } from './client-adapters.mjs';
 import { createActivityReporter } from './activity.mjs';
-import { usageReports } from './usage.mjs';
+import { createUsageCollector } from './usage.mjs';
 import { acquireWorkerLock } from './worker-lock.mjs';
 
 /** Runs a small real client probe. HTTP reachability alone never passes enrollment. */
@@ -27,6 +27,7 @@ export async function enroll(options) {
   const file = join(directory, 'state.json');
   const state = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { identity, workerId: randomUUID(), usage: [] };
   if (state.identity !== identity) throw new Error('Worker state belongs to another connection.');
+  if (state.usageAttention) throw Object.assign(new Error('Enrollment is paused because exact provider usage could not be recovered. Reconcile the retained session and local usageAttention record before starting another paid probe.'), { code: 'WORKER_USAGE_ATTENTION', retryable: false });
   const persist = () => { writeFileSync(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 }); renameSync(`${file}.tmp`, file); };
   const request = async data => {
     const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/worker`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ workerId: state.workerId, ...data }), redirect: 'error', signal: AbortSignal.timeout(20000) });
@@ -45,6 +46,7 @@ export async function enroll(options) {
   const proof = randomUUID(), proofName = `.ehgi-enrollment-${randomUUID()}`, activity = createActivityReporter({ statePath: join(directory, 'activity.json'), server: options.host, token, fetch: options.fetch });
   if (existsSync(join(cwd, proofName))) throw new Error('Enrollment proof file already exists.');
   let reportIndex = 0;
+  const collectUsage = createUsageCollector(capability.client, options.model);
   const flushUsage = async () => {
     while (state.usage.length) {
       const response = await (options.fetch ?? fetch)(`${options.host}/api/usage/report`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(state.usage[0]), redirect: 'error', signal: AbortSignal.timeout(10000) });
@@ -56,16 +58,21 @@ export async function enroll(options) {
     const prompt = `This is an operator-authorized EhGI enrollment verification in a temporary Git worktree. Read AGENTS.md if present. Call get_briefing through the configured EhGI MCP server and obey stop_requested. Then call workforce_action with action "enrollment_verify" and input ${JSON.stringify({ workerId: state.workerId, challenge: challenge.challenge })}. Write exactly ${JSON.stringify(proof)} into ${proofName} using your file-edit tool, then read it back. Do not edit other files, claim tasks, open PRs, or change client permissions. Report any missing tools or approval requirement honestly and stop.`;
     lock.setPhase('client_active');
     try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, profile: options.profile, model: options.model, write: true, timeoutMs: 180000, signal: options.signal, onActivity: event => activity.record(event, { runId }), onUsage: raw => {
-      for (const report of usageReports(capability.client, raw, options.model)) state.usage.push({ ...report, event_id: `${runId}-${reportIndex++}`, session_id: runId, phase: 'coordination', source: 'cli_stream' }); persist();
+      for (const report of collectUsage(raw)) state.usage.push({ ...report, event_id: `${runId}-${reportIndex++}`, session_id: runId, phase: 'coordination', source: 'cli_stream' }); persist();
     } }); } finally { lock.setPhase('idle'); }
     const proofPath = join(cwd, proofName);
     if (!existsSync(proofPath) || !lstatSync(proofPath).isFile() || lstatSync(proofPath).isSymbolicLink() || readFileSync(proofPath, 'utf8').trim() !== proof) throw new Error('The actual client did not complete its local file-edit probe.');
-    if (reportIndex === 0) throw new Error('The actual client returned no measurable usage during enrollment. Inspect its structured usage adapter before starting paid work.');
+    if (reportIndex === 0) throw Object.assign(new Error('The actual client returned no measurable usage during enrollment. Inspect its structured usage adapter before starting paid work.'), { code: 'WORKER_USAGE_UNAVAILABLE', retryable: false });
     if (JSON.stringify(executionBinding(capability, options)) !== JSON.stringify(execution)) throw new Error('Codex configuration changed during enrollment, possibly from first-run trust initialization. Review the saved configuration and rerun the probe without resetting it.');
     const result = await request({ action: 'verify' });
     if (!result.verified) throw new Error('The hub did not verify the actual client MCP roundtrip.');
     state.enrollment = { verifiedAt: new Date().toISOString(), client: capability.client, version: capability.version, repository, execution, capabilities: { ...capabilityContract(capability), verifiedExecution: true } }; persist();
     return { verified: true, workerId: state.workerId, state: directory, capabilities: state.enrollment.capabilities, next: 'Start worker with the same --state and enable automatic assignments in Workforce. Enrollment proves this client/version can call MCP and edit locally; merge/deploy remain governed by project policy.' };
+  } catch (error) {
+    if (error.usageRecoveryError || ['CODEX_USAGE_UNAVAILABLE', 'WORKER_USAGE_UNAVAILABLE'].includes(error.code)) {
+      state.usageAttention = { runId, recordedAt: new Date().toISOString(), reason: 'Exact-session provider usage was unavailable; no estimate was substituted.', ...(typeof error.sessionId === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(error.sessionId) ? { sessionId: error.sessionId } : {}) }; persist();
+    }
+    throw error;
   } finally {
     await flushUsage().catch(() => {});
     await activity.close().catch(() => {});

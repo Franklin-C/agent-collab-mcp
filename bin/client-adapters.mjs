@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { clientActivity, clientUsageActivity } from './activity.mjs';
 import { codexConfigurationBinding, codexProfileName } from './codex-config.mjs';
+import { createCodexUsageRecovery } from './codex-usage.mjs';
 
 export const CLIENTS = {
   codex: { executable: 'codex', documentation: 'https://learn.chatgpt.com/docs/non-interactive-mode' },
@@ -123,7 +124,9 @@ export function readClientDiagnostic(client, text) {
 
 /** No shell, unsafe approval bypass, global --latest session or token in argv. */
 export async function runClient(capability, prompt, options = {}) {
+  if (options.signal?.aborted) throw Object.assign(new Error('Client turn was cancelled before execution.'), { name: 'AbortError', retryable: false });
   const call = invocation(capability, options.sessionId, options);
+  const usageRecovery = capability.client === 'codex' && options.onUsage ? createCodexUsageRecovery({ sessionId: options.sessionId, cwd: options.cwd ?? process.cwd(), env: options.env ?? process.env }) : null;
   return await new Promise((resolve, reject) => {
     const child = (options.spawn ?? spawn)(call.command, call.args, { cwd: options.cwd, env: options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
     let buffer = '', diagnosticBuffer = '', sessionId = options.sessionId ?? null, failed = false, requiresApproval = false, requiresAuthentication = false, authenticationHint = false, completed = false, bytes = 0, settled = false;
@@ -146,6 +149,7 @@ export async function runClient(capability, prompt, options = {}) {
       authenticationHint ||= parsed.authenticationHint === true;
       try {
         const raw = JSON.parse(line);
+        usageRecovery?.observe(raw);
         try { options.onUsage?.(raw); } catch { /* A failed usage sink does not hide passive observations. */ }
         for (const event of [...clientActivity(capability.client, raw), ...clientUsageActivity(capability.client, raw)]) activity(event);
       } catch { /* Non-JSON diagnostics are not usage or activity. */ } sessionId = parsed.sessionId ?? sessionId; failed ||= parsed.failed; completed ||= parsed.completed;
@@ -170,10 +174,21 @@ export async function runClient(capability, prompt, options = {}) {
       const alreadyFailed = settled;
       settled = true; clearTimeout(timer); options.signal?.removeEventListener('abort', stop);
       if (buffer) consume(buffer);
+      let usageRecoveryError;
+      if (!alreadyFailed && usageRecovery && (code !== 0 || failed || !completed || requiresApproval || requiresAuthentication || options.signal?.aborted)) {
+        try {
+          const recovered = usageRecovery.recover();
+          if (recovered) {
+            options.onUsage(recovered);
+            for (const event of clientUsageActivity(capability.client, recovered)) activity(event);
+          }
+        } catch { usageRecoveryError = 'Exact-session provider usage recovery was unavailable; no token estimate was substituted.'; }
+      }
       requiresAuthentication ||= authenticationHint && (capability.client === 'gemini-cli' ? code === 41 : capability.client === 'claude-code' && typeof code === 'number' && code !== 0);
       failed ||= requiresApproval || requiresAuthentication;
       if (!alreadyFailed) activity({ kind: options.signal?.aborted ? 'run_stopped' : requiresAuthentication ? 'needs_authentication' : requiresApproval ? 'needs_permission' : code !== 0 || failed || !completed ? 'run_failed' : 'run_finished' });
-      if (code !== 0 || failed || !completed || options.signal?.aborted) reject(Object.assign(new Error(requiresAuthentication ? `${capability.client} requires sign-in before unattended work can continue. ${capability.client === 'claude-code' ? 'Open Claude Code and run /login' : 'Configure authentication in Gemini CLI'}, then rerun enrollment. Events remain pending.` : requiresApproval ? `${capability.client} requires approval for its configured tools before unattended work can continue. Resolve the denied permission in the client, then rerun enrollment. Events remain pending.` : `${capability.client} turn did not complete (${signal ?? code}${failed ? ', provider error' : ''}). Events remain pending.`), { sessionId, requiresApproval, requiresAuthentication }));
+      if (options.signal?.aborted) reject(Object.assign(new Error(`${capability.client} turn was cancelled. Events remain pending.`), { name: 'AbortError', retryable: false, sessionId, requiresApproval, requiresAuthentication, ...(usageRecoveryError ? { usageRecoveryError } : {}) }));
+      else if (code !== 0 || failed || !completed) reject(Object.assign(new Error(requiresAuthentication ? `${capability.client} requires sign-in before unattended work can continue. ${capability.client === 'claude-code' ? 'Open Claude Code and run /login' : 'Configure authentication in Gemini CLI'}, then rerun enrollment. Events remain pending.` : requiresApproval ? `${capability.client} requires approval for its configured tools before unattended work can continue. Resolve the denied permission in the client, then rerun enrollment. Events remain pending.` : `${capability.client} turn did not complete (${signal ?? code}${failed ? ', provider error' : ''}). Events remain pending.`), { sessionId, requiresApproval, requiresAuthentication, ...(usageRecoveryError ? { usageRecoveryError } : {}) }));
       else resolve({ sessionId, completed, bytes });
     });
     child.stdin.on('error', () => {});
