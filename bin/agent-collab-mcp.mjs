@@ -173,7 +173,7 @@ async function doctor() {
   // rungs this call cannot prove by itself are sent; reaching here already
   // proves the host is reachable and the token is accepted. Reporting is
   // best-effort and never fails the doctor run.
-  if (flags.report) {
+  if (flags.report === "true") {
     const reported = await fetch(`${base}/api/agent/readiness`, {
       method: "POST", signal: AbortSignal.timeout(15000),
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
