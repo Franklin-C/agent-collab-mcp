@@ -4,6 +4,7 @@ import { lstat, open, opendir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
+import { codexRequiresUpdate } from './client-errors.mjs';
 
 const fields = ['input_tokens', 'output_tokens', 'cached_input_tokens'];
 const zero = () => Object.fromEntries(fields.map(field => [field, 0]));
@@ -31,11 +32,11 @@ export function codexSessionDates(sessionId) {
   return [-1, 0, 1].map(offset => new Date(timestamp + offset * 86400000).toISOString().slice(0, 10).replaceAll('-', '/'));
 }
 
-/** One reader per invocation. Only the identified file's counters leave it. */
+/** One reader per invocation. Only validated counters and fixed diagnostic kinds leave it. */
 export function createCodexCheckpointReader({ cwd, env = process.env, maxBytes = 16 * 1024 * 1024 }) {
   const home = resolve(env.CODEX_HOME || join(homedir(), '.codex'));
-  let previous = null, reading = null, identity = null;
-  async function read(sessionId) {
+  let previous = null, reading = null, identity = null, diagnosticThrough = 0;
+  async function read(sessionId, { onDiagnostic } = {}) {
     const dates = codexSessionDates(sessionId);
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) throw fail('Invalid Codex checkpoint read bound.');
     const candidates = [];
@@ -79,9 +80,11 @@ export function createCodexCheckpointReader({ cwd, env = process.env, maxBytes =
     } finally { await file.close(); }
     if (previous && digest(buffer.subarray(0, previous.size)) !== previous.digest) throw fail('Codex checkpoint previously observed bytes changed.');
     const text = buffer.toString('utf8'), lines = text.split('\n');
-    let metadata = false, latest = null;
+    let metadata = false, latest = null, offset = 0;
+    const diagnostics = new Set();
     for (let index = 0; index < lines.length; index++) {
       if (index % 256 === 0) await setImmediate();
+      const start = offset; offset += Buffer.byteLength(lines[index], 'utf8') + 1;
       const line = lines[index].trim(); if (!line) continue;
       // Only newline-terminated records are committed provider evidence.
       if (index === lines.length - 1 && !text.endsWith('\n')) break;
@@ -92,6 +95,7 @@ export function createCodexCheckpointReader({ cwd, env = process.env, maxBytes =
         if (event?.type !== 'session_meta' || value?.id !== sessionId || value.session_id !== undefined && value.session_id !== sessionId || value.source !== 'exec' || typeof value.cwd !== 'string' || canonical(await realpath(value.cwd)) !== canonical(await realpath(cwd))) throw fail('Codex checkpoint does not match this exact exec session and workspace.');
         metadata = true; continue;
       }
+      if (start >= diagnosticThrough && event?.type === 'event_msg' && event.payload?.type === 'task_complete' && codexRequiresUpdate(event.payload)) diagnostics.add('codex_update_required');
       if (event?.type !== 'event_msg' || event.payload?.type !== 'token_count' || !event.payload.info?.total_token_usage) continue;
       const totals = counters(event.payload.info.total_token_usage);
       if (latest && !atLeast(totals, latest.totals)) throw fail('Codex checkpoint counters regressed.');
@@ -99,13 +103,20 @@ export function createCodexCheckpointReader({ cwd, env = process.env, maxBytes =
     }
     if (!metadata && text.includes('\n')) throw fail('Codex checkpoint lacks exact-session metadata.');
     previous = { path, sessionId, dev: opened.dev, ino: opened.ino, birthtimeMs: opened.birthtimeMs, size: buffer.length, digest: digest(buffer) };
+    // Nothing leaves a malformed/partial snapshot. A silent resume baseline
+    // consumes its entire prefix so prior-turn failures cannot label a new run.
+    if (!onDiagnostic) diagnosticThrough = buffer.length;
+    else if (metadata && text.endsWith('\n')) {
+      diagnosticThrough = buffer.length;
+      for (const kind of diagnostics) onDiagnostic(kind);
+    }
     return latest;
   }
-  return sessionId => {
+  return (sessionId, options) => {
     if (identity && identity !== sessionId) return Promise.reject(fail('Codex checkpoint reader cannot change session identity.'));
     identity = sessionId;
     if (reading) return reading;
-    reading = read(sessionId).catch(error => { throw error.code === 'CODEX_USAGE_UNAVAILABLE' ? error : fail('Codex checkpoint could not be safely read.'); }).finally(() => { reading = null; });
+    reading = read(sessionId, options).catch(error => { throw error.code === 'CODEX_USAGE_UNAVAILABLE' ? error : fail('Codex checkpoint could not be safely read.'); }).finally(() => { reading = null; });
     return reading;
   };
 }
@@ -115,12 +126,13 @@ export async function createCodexUsageNormalizer(options) {
   const read = options.readCheckpoint ?? createCodexCheckpointReader(options);
   const readTimeoutMs = options.readTimeoutMs ?? 5000;
   if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 10 || readTimeoutMs > 30000) throw fail('Invalid Codex checkpoint read deadline.');
-  const boundedRead = (id, signal) => new Promise((resolve, reject) => {
+  const boundedRead = (id, signal, collectDiagnostics = true) => new Promise((resolve, reject) => {
     let settled = false;
+    const diagnostics = new Set();
     const done = (error, value) => {
       if (settled) return;
       settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
-      if (error) reject(error); else resolve(value);
+      if (error) reject(error); else resolve({ checkpoint: value, diagnostics: [...diagnostics] });
     };
     const abort = () => done(Object.assign(new Error('Codex resume baseline was cancelled before execution.'), { name: 'AbortError', retryable: false }));
     const timer = setTimeout(() => done(fail('Codex checkpoint read exceeded its deadline.')), readTimeoutMs);
@@ -128,12 +140,12 @@ export async function createCodexUsageNormalizer(options) {
     if (signal?.aborted) { abort(); return; }
     // A timed-out OS read may finish later. Its result is latched out and can
     // never reach accounting; callers retain a durable pause instead of retrying.
-    Promise.resolve().then(() => read(id)).then(value => done(null, value), error => done(error));
+    Promise.resolve().then(() => read(id, collectDiagnostics ? { onDiagnostic: kind => { if (!settled && kind === 'codex_update_required') diagnostics.add(kind); } } : undefined)).then(value => done(null, value), error => done(error));
   });
   let sessionId = options.sessionId ?? null, native = null, published = zero(), stdout = zero(), closed = false, fault = null;
   const resumed = Boolean(sessionId), seen = new Set();
   if (sessionId) codexSessionDates(sessionId);
-  const baseline = sessionId ? await boundedRead(sessionId, options.signal) : null;
+  const baseline = sessionId ? (await boundedRead(sessionId, options.signal, false)).checkpoint : null;
   if (resumed && !baseline) throw fail('An exact-session Codex usage baseline is required before resuming.');
   const start = baseline ? counters(baseline.totals) : zero();
   let chain = Promise.resolve();
@@ -155,7 +167,8 @@ export async function createCodexUsageNormalizer(options) {
       if (final && completed) throw fail('Codex completed without an exact provider session identifier.');
       return;
     }
-    const checkpoint = await boundedRead(sessionId);
+    const { checkpoint, diagnostics } = await boundedRead(sessionId);
+    for (const kind of diagnostics) { try { options.onDiagnostic?.(kind); } catch { /* Observation cannot change accounting. */ } }
     if (checkpoint) {
       const run = difference(counters(checkpoint.totals), start);
       if (native && !atLeast(run, native)) throw fail('Codex provider counters regressed between samples.');
