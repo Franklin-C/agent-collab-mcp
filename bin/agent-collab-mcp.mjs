@@ -18,6 +18,10 @@ import { supervise } from "./supervisor.mjs";
 const [command, ...rest] = process.argv.slice(2);
 const flags = {};
 const positional = [];
+const BOOLEAN_FLAGS = new Set([
+  "print", "write", "once", "apply", "configure", "start", "install", "uninstall",
+  "reset-recovery", "verify-github", "retry-failed", "report", "resume",
+]);
 
 for (let index = 0; index < rest.length; index += 1) {
   const arg = rest[index];
@@ -26,7 +30,10 @@ for (let index = 0; index < rest.length; index += 1) {
     const key = arg.slice(2);
     const next = rest[index + 1];
 
-    if (next && !next.startsWith("--")) {
+    if (BOOLEAN_FLAGS.has(key)) {
+      // Preserve positional arguments after switches; accept explicit booleans.
+      flags[key] = next === "true" || next === "false" ? rest[++index] : "true";
+    } else if (next && !next.startsWith("--")) {
       flags[key] = next;
       index += 1;
     } else {

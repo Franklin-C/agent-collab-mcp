@@ -7,7 +7,12 @@ export async function checkUpdate({ force = false, fetcher = fetch, log = consol
   const directory = join(homedir(), '.agent-collab');
   const cache = join(directory, 'update-check.json');
   try {
-    if (!force && existsSync(cache)) { const previous = JSON.parse(readFileSync(cache, 'utf8')); if (previous.name === manifest.name && Date.now() - previous.at < 86400000) return { status: 'cached' }; }
+    if (!force && existsSync(cache)) {
+      let previous = null;
+      try { previous = JSON.parse(readFileSync(cache, 'utf8')); } catch { /* Recheck a cache that cannot be read. */ }
+      const age = Number.isFinite(previous?.at) ? Date.now() - previous.at : NaN;
+      if (previous?.name === manifest.name && age >= 0 && age < 86400000) return { status: 'cached' };
+    }
     const response = await fetcher(`https://registry.npmjs.org/${encodeURIComponent(manifest.name)}/latest`, { signal: AbortSignal.timeout(5000) });
     if (response.status === 404) return { status: 'unpublished', current: manifest.version };
     if (!response.ok) return { status: 'unavailable' };

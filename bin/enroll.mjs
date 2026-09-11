@@ -31,8 +31,11 @@ export async function enroll(options) {
   const persist = () => { writeFileSync(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 }); renameSync(`${file}.tmp`, file); };
   const request = async data => {
     const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/worker`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ workerId: state.workerId, ...data }), redirect: 'error', signal: AbortSignal.timeout(20000) });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? `Enrollment returned ${response.status}`);
+    let result;
+    try { result = await response.json(); }
+    catch (error) { if (response.ok) throw error; } // Malformed success still fails before the client probe.
+    if (!response.ok) throw Object.assign(new Error(typeof result?.error === 'string' ? result.error : `Enrollment returned ${response.status}`), { status: response.status });
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Enrollment returned an invalid response object.');
     return result;
   };
   persist();

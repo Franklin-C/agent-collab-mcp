@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -168,4 +168,61 @@ test('Codex reconnect preserves name and unrelated settings and never duplicates
   assert.equal(configureCodex(after, 'https://ehgi.ai/api/mcp'), after);
   assert.throws(() => configureCodex(after, 'https://other.test/api/mcp'), /differs/);
   assert.throws(() => configureCodex(before + '[mcp_servers.agent_collab]\n', 'https://ehgi.ai/api/mcp'), /Multiple/);
+});
+
+for (const stage of ['register', 'challenge']) {
+  for (const [status, body, message] of [
+    [401, '<html>Unauthorized</html>', 'Enrollment returned 401'],
+    [403, 'null', 'Enrollment returned 403'],
+    [502, '', 'Enrollment returned 502'],
+    [503, 'not JSON', 'Enrollment returned 503'],
+    [409, '{"error":"The enrollment challenge changed."}', 'The enrollment challenge changed.'],
+    [503, '{"error":{"private":"unexpected payload"}}', 'Enrollment returned 503'],
+  ]) test(`enrollment ${stage} preserves HTTP ${status} without starting a client: ${body.slice(0, 12)}`, async t => {
+    const options = fixture(t), actions = []; let turns = 0;
+    await assert.rejects(enroll({ ...options, fetch: async (url, request) => {
+      assert.equal(url, `${options.host}/api/agent/worker`);
+      assert.equal(request.redirect, 'error');
+      const packet = JSON.parse(request.body); actions.push(packet.action);
+      return packet.action === stage ? new Response(body, { status }) : Response.json({ registered: true });
+    }, runClient: async () => { turns++; } }), error => error.status === status && error.message === message);
+    assert.deepEqual(actions, stage === 'register' ? ['register'] : ['register', 'challenge']);
+    assert.equal(turns, 0);
+    assert.equal(existsSync(join(options.state, 'enrollment')), false);
+    assert.equal(existsSync(join(options.state, 'worker.lock')), false);
+    assert.equal(JSON.parse(readFileSync(join(options.state, 'state.json'))).enrollment, undefined);
+  });
+  for (const body of ['<html>Invalid success</html>', 'null', '[]']) test(`enrollment ${stage} rejects malformed successful response ${body} before a client`, async t => {
+    const options = fixture(t), actions = []; let turns = 0;
+    await assert.rejects(enroll({ ...options, fetch: async (_url, request) => {
+      const packet = JSON.parse(request.body); actions.push(packet.action);
+      return packet.action === stage ? new Response(body, { status: 200 }) : Response.json({ registered: true });
+    }, runClient: async () => { turns++; } }), error => error instanceof SyntaxError || /invalid response object/.test(error.message));
+    assert.deepEqual(actions, stage === 'register' ? ['register'] : ['register', 'challenge']);
+    assert.equal(turns, 0);
+    assert.equal(existsSync(join(options.state, 'worker.lock')), false);
+    assert.equal(JSON.parse(readFileSync(join(options.state, 'state.json'))).enrollment, undefined);
+  });
+}
+
+test('a malformed HTTP verification error preserves final usage and releases the enrollment lock', async t => {
+  const options = fixture(t), reports = []; let turns = 0;
+  await assert.rejects(enroll({ ...options, fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) { reports.push(JSON.parse(request.body)); return new Response('', { status: 503 }); }
+    const packet = JSON.parse(request.body);
+    if (packet.action === 'verify') return new Response('<html>Gateway unavailable</html>', { status: 503 });
+    return options.fetch(url, request);
+  }, runClient: async (_client, prompt, run) => {
+    turns++;
+    writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
+    run.onUsage({ type: 'ehgi.codex_usage_snapshot', event_id: 'final', usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 5 } });
+    return { completed: true };
+  } }), error => error.status === 503 && error.message === 'Enrollment returned 503');
+  assert.equal(turns, 1, 'The injected fixture ran once; no real provider was called');
+  assert.ok(reports.length >= 1);
+  const state = JSON.parse(readFileSync(join(options.state, 'state.json')));
+  assert.equal(state.enrollment, undefined);
+  assert.deepEqual(state.usage, [reports[0]]);
+  assert.ok(reports.every(report => JSON.stringify(report) === JSON.stringify(reports[0])));
+  assert.equal(existsSync(join(options.state, 'worker.lock')), false);
 });
