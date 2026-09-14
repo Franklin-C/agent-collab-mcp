@@ -104,7 +104,10 @@ test('watch --report uploads changed native session counters without billing or 
       pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
     } else if (request.url === '/api/agent/watch') {
       watchCalls++;
+      assert.equal(JSON.parse(text).task_id, 'task_83');
+      assert.equal(JSON.parse(text).lease_version, 5);
       if (watchCalls === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: '01900000-0000-7000-8000-000000000099', last_agent_message: 'PRIVATE' } })}\n`);
+      if (watchCalls === 1) { response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: false })); return; }
       pendingWatch = response;
     } else { billingCalls++; response.writeHead(500).end(); }
   }, ({ code, stderr, status }) => {
@@ -118,6 +121,8 @@ test('watch --report uploads changed native session counters without billing or 
     const { kind, inputTokens, outputTokens, usageScope, runId } = packets[0].events[0];
     assert.deepEqual({ kind, inputTokens, outputTokens, usageScope, runId }, { kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId });
     const latest = packets[0].events.at(-1);
+    assert.equal(latest.taskId, 'task_83');
+    assert.equal(packets[0].events[0].taskId, undefined, 'session totals must not be attributed to the current task');
     const visibleUsage = packets[0].events.find(event => event.kind === 'usage_reported' && event.runId === latest.runId);
     assert.equal(visibleUsage?.inputTokens, 200, 'turn completion must retain usage for the same native activity stream');
     assert(!JSON.stringify(packets).includes('PRIVATE'));
@@ -129,7 +134,7 @@ test('watch --report uploads changed native session counters without billing or 
       { type: 'event_msg', payload: { type: 'task_started', turn_id: '01900000-0000-7000-8000-000000000099' } },
       { type: 'message', text: 'PRIVATE' }, usage(100),
     ].map(row => JSON.stringify(row)).join('\n') + '\n');
-    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory, '--task', 'task_83', '--lease', '5'];
   }, 45000);
 });
 

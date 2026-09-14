@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { checkUpdate } from "./update-check.mjs";
 import { supervise } from "./supervisor.mjs";
 import { startWatchObservations } from "./watch-observations.mjs";
+import { createWatchTaskContext } from "./watch-task-context.mjs";
 import { acquireWorkerLock } from "./worker-lock.mjs";
 import { setTimeout as watchDelay } from "node:timers/promises";
 
@@ -234,18 +235,20 @@ async function watch() {
   let cursor = readJson(cursorFile).seq ?? Number(flags.since ?? 0);
   if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Invalid watch cursor.");
   if (flags.task && !/^\d+$/.test(flags.lease ?? "")) throw new Error("--task requires --lease <fencing version> from claim_task.");
+  const taskContext = createWatchTaskContext(flags.task, Number(flags.lease));
   let failures = 0;
   let observations;
   try {
   if (flags.report === 'true') {
     observations = await startWatchObservations({ client: flags.client, sessionId: flags.session, sessionFile: flags['session-file'], cwd: flags.cwd,
-      server: base, token, directory, signal: cancellation.signal,
+      server: base, token, directory, signal: cancellation.signal, currentTask: () => taskContext.current(),
       onStatus: reporting => status({ reporting }),
       onAuthenticationFailure: () => stop('authentication_required', 1) });
     status({ mode: 'events_with_observations' });
   }
   do {
     try {
+      const requestStartedAt = performance.now();
       const response = await fetch(`${base}/api/agent/watch`, {
         method: "POST", signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(55000)]),
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -264,6 +267,8 @@ async function watch() {
       const result = await response.json();
       if (cancellation.signal.aborted) return;
       if (!Number.isSafeInteger(result.next_seq) || result.next_seq < cursor || !Array.isArray(result.events)) throw new Error("Invalid watch response.");
+      if (result.stop_requested) taskContext.clear();
+      else taskContext.confirm(requestStartedAt);
       if (result.events.length) {
         // Durable spool precedes cursor advancement; replay can duplicate, never lose events.
         safeWrite(join(directory, `events-${cursor}-${result.next_seq}.json`), JSON.stringify(result), false);
@@ -276,6 +281,7 @@ async function watch() {
       status({ state: result.stop_requested ? "stopped" : "connected", reason: result.stop_requested ? "stop_requested" : null, seq: cursor, failures, last_success_at: new Date().toISOString(), next_retry_at: null });
       if (result.stop_requested) return;
     } catch (error) {
+      taskContext.clear();
       if (cancellation.signal.aborted) return;
       if (error.fatal || flags.once === "true") {
         status({ state: "stopped", reason: error.reason ?? "request_failed", next_retry_at: null });

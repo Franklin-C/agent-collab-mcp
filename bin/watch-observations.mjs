@@ -48,7 +48,8 @@ export async function startWatchObservations(options) {
         // The native watch is one session-scoped activity stream. Keep its
         // lifecycle and counters together: the hub selects usage by runId.
         // The turn identity above still detects distinct turns of the same kind.
-        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: sessionId })) lastTurn = turnKey;
+        const taskId = options.currentTask?.();
+        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });

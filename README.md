@@ -229,6 +229,9 @@ authentication failures stop the watcher. Quiet logs never imply an agent signed
 Codex also reports the latest explicit turn start, completion or abort after the
 baseline read. A turn finishing does not mark the session offline. Claude turn
 lifecycle reporting is not yet supported; its token observations remain available.
+With `--task <id> --lease <version>`, new turn activity includes the task only
+after a successful watch confirmation. Failed or stale confirmations drop that
+context. Session token totals stay unassigned; they span more than one task.
 
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
