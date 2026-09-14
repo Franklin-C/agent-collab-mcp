@@ -271,7 +271,7 @@ test('fresh assignments direct agents to the current General and GitHub workflow
     return f.options.runClient(client, prompt, args);
   } });
   assert.match(deliveredPrompt, /Use General for task questions, decisions and suggestions/);
-  assert.match(deliveredPrompt, /Call get_briefing first, then get_inbox/);
+  assert.match(deliveredPrompt, /Call get_briefing first with have_repo_playbook: true after reading AGENTS\.md, then get_inbox/);
   assert.match(deliveredPrompt, /assignment task association/);
   assert.match(deliveredPrompt, /channel and thread IDs returned by the hub/);
   assert.match(deliveredPrompt, /GitHub Projects for task planning, GitHub issues for verified bugs/);
