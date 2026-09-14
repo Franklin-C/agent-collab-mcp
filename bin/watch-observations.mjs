@@ -11,7 +11,7 @@ export async function startWatchObservations(options) {
   if (!['codex', 'claude-code'].includes(client) || !sessionId || !sessionFile || !cwd || !isAbsolute(sessionFile) || !isAbsolute(cwd) || !signal) {
     throw new Error('watch --report requires --client codex|claude-code, --session <UUID>, --session-file <absolute path> and --cwd <absolute repository path>.');
   }
-  const observe = createSessionFileObserver(sessionFile, { client, sessionId, cwd });
+  const observe = createSessionFileObserver(sessionFile, { client, sessionId, cwd, signal });
   const baseline = await observe();
   signal.throwIfAborted();
   const controller = new AbortController();

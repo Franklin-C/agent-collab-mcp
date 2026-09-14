@@ -64,3 +64,20 @@ test('waits for a fresh Claude session first usage record without latching a fal
   await appendFile(path, JSON.stringify({ type: 'assistant', sessionId, cwd, message: { id: 'first', model: 'claude-opus-5', usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) + '\n');
   assert.equal((await observe())[0].output_tokens, 2);
 }));
+
+test('an already stopped watcher refuses even the initial file lookup', () => fixture(async ({ path, options }) => {
+  const reason = new Error('operator stopped');
+  const signal = AbortSignal.abort(reason);
+  await assert.rejects(readSessionObservation(`${path}.missing`, { ...options, signal }), error => error === reason);
+}));
+
+test('stop during an asynchronous scan discards its result and keeps the abort reason', () => fixture(async ({ path, options, content }) => {
+  await writeFile(path, content + `${JSON.stringify({ type: 'message', text: 'private'.repeat(10000) })}\n`.repeat(100));
+  const controller = new AbortController();
+  const observe = createSessionFileObserver(path, { ...options, signal: controller.signal });
+  const pending = observe();
+  const reason = new Error('watch stopped during scan');
+  controller.abort(reason);
+  await assert.rejects(pending, error => error === reason);
+  await assert.rejects(observe(), error => error === reason);
+}));

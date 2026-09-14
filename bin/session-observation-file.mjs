@@ -15,18 +15,21 @@ export function createSessionFileObserver(path, options) {
   const absolute = resolve(path), parser = createSessionObservationParser(options.client, options), decoder = new StringDecoder('utf8');
   let identity = null, offset = 0, pending = '', committed = false, reading = null, fault = null;
   async function read() {
+    options.signal?.throwIfAborted();
     if (fault) throw fault;
     const before = await lstat(absolute);
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size < offset
       || identity && !sameFile(identity, before) || canonical(await realpath(absolute)) !== canonical(absolute)) throw failure();
     const file = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
+      options.signal?.throwIfAborted();
       const opened = await file.stat();
       if (!opened.isFile() || opened.nlink !== 1 || !sameFile(opened, before) || opened.size < offset) throw failure();
       identity ??= opened;
       if (opened.size > offset) {
-        const stream = file.createReadStream({ start: offset, end: opened.size - 1, autoClose: false, highWaterMark: 65536 });
+        const stream = file.createReadStream({ start: offset, end: opened.size - 1, autoClose: false, highWaterMark: 65536, signal: options.signal });
         for await (const chunk of stream) {
+          options.signal?.throwIfAborted();
           pending += decoder.write(chunk);
           offset += chunk.length;
           let end;
@@ -39,13 +42,17 @@ export function createSessionFileObserver(path, options) {
         }
       }
       const after = await lstat(absolute);
+      options.signal?.throwIfAborted();
       if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1 || !sameFile(after, opened) || after.size < offset) throw failure();
     } finally { await file.close(); }
     return committed ? parser.snapshot() : null;
   }
   return () => {
     if (reading) return reading;
-    reading = read().catch(() => { fault = failure(); throw fault; }).finally(() => { reading = null; });
+    reading = read().catch(error => {
+      if (options.signal?.aborted) throw options.signal.reason ?? error;
+      fault = failure(); throw fault;
+    }).finally(() => { reading = null; });
     return reading;
   };
 }
