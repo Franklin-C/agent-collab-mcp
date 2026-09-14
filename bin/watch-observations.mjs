@@ -18,6 +18,9 @@ export async function startWatchObservations(options) {
   let lastWorkspace = JSON.stringify(observe.workspaceMetadata());
   signal.throwIfAborted();
   const connectionIdentity = await readConnectionIdentity({ server, token, signal });
+  // Stop may arrive after identity validation but before this await resumes.
+  // Do not attach a listener to an already-aborted signal and start a new loop.
+  signal.throwIfAborted();
   const controller = new AbortController();
   const stop = () => controller.abort();
   signal.addEventListener('abort', stop, { once: true });
