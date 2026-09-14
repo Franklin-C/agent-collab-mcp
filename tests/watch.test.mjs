@@ -104,7 +104,7 @@ test('watch --report uploads changed native session counters without billing or 
       pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
     } else if (request.url === '/api/agent/watch') {
       watchCalls++;
-      if (watchCalls === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n`);
+      if (watchCalls === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: '01900000-0000-7000-8000-000000000099', last_agent_message: 'PRIVATE' } })}\n`);
       pendingWatch = response;
     } else { billingCalls++; response.writeHead(500).end(); }
   }, ({ code, stderr, status }) => {
@@ -114,13 +114,16 @@ test('watch --report uploads changed native session counters without billing or 
     assert.equal(status.automatic_client_resume, false);
     assert.equal(status.reason, 'stop_requested');
     assert.equal(packets.length, 1);
-    assert.deepEqual(packets[0].events.map(({ kind, inputTokens, outputTokens, usageScope, runId }) => ({ kind, inputTokens, outputTokens, usageScope, runId })), [{ kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId }]);
+    assert.deepEqual(packets[0].events.map(event => event.kind), ['usage_reported', 'run_finished']);
+    const { kind, inputTokens, outputTokens, usageScope, runId } = packets[0].events[0];
+    assert.deepEqual({ kind, inputTokens, outputTokens, usageScope, runId }, { kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId });
     assert(!JSON.stringify(packets).includes('PRIVATE'));
   }, directory => {
     const file = join(directory, 'session.jsonl');
     writeFileSync(file, [
       { type: 'session_meta', payload: { id: sessionId, cwd: directory } },
       { type: 'turn_context', payload: { model: 'gpt-6-astra' } },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: '01900000-0000-7000-8000-000000000099' } },
       { type: 'message', text: 'PRIVATE' }, usage(100),
     ].map(row => JSON.stringify(row)).join('\n') + '\n');
     return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];

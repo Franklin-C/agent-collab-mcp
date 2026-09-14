@@ -13,6 +13,7 @@ export async function startWatchObservations(options) {
   }
   const observe = createSessionFileObserver(sessionFile, { client, sessionId, cwd, signal });
   const baseline = await observe();
+  let lastTurn = JSON.stringify(observe.turnState());
   signal.throwIfAborted();
   const controller = new AbortController();
   const stop = () => controller.abort();
@@ -40,6 +41,11 @@ export async function startWatchObservations(options) {
         const snapshot = await observe();
         controller.signal.throwIfAborted();
         const accepted = recorder.record(snapshot);
+        // Publish the latest explicit turn state after usage so a completed
+        // turn is not made to look active by its final token observation.
+        const turn = observe.turnState();
+        const turnKey = JSON.stringify(turn);
+        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: turn.runId })) lastTurn = turnKey;
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });

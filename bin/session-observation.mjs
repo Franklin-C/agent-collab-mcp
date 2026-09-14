@@ -94,7 +94,7 @@ export function createSessionObservationParser(client, { sessionId, cwd, platfor
     return { model, ...usage, token_semantics: client === 'codex' ? 'inclusive' : 'anthropic' };
   });
   }
-  return { observe, snapshot };
+  return { observe, snapshot, isVerified: () => verified };
 }
 
 export function parseSessionObservation(client, records, options) {

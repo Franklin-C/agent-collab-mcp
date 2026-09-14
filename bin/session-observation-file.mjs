@@ -3,6 +3,7 @@ import { lstat, open, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { createSessionObservationParser } from './session-observation.mjs';
+import { createNativeTurnState } from './native-turn-state.mjs';
 
 const failure = () => new Error('The exact session log cannot be safely observed.');
 const canonical = path => process.platform === 'win32' ? path.toLowerCase() : path;
@@ -13,6 +14,8 @@ export function createSessionFileObserver(path, options) {
   const maxRecordBytes = options.maxRecordBytes ?? 8 * 1024 * 1024;
   if (typeof path !== 'string' || !path || !Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1 || maxRecordBytes > 64 * 1024 * 1024) throw failure();
   const absolute = resolve(path), parser = createSessionObservationParser(options.client, options), decoder = new StringDecoder('utf8');
+  const turns = createNativeTurnState(options.client, options.sessionId);
+  let committedTurn = null;
   let identity = null, offset = 0, pending = '', committed = false, reading = null, fault = null;
   async function read() {
     options.signal?.throwIfAborted();
@@ -36,7 +39,12 @@ export function createSessionFileObserver(path, options) {
           while ((end = pending.indexOf('\n')) >= 0) {
             const line = pending.slice(0, end); pending = pending.slice(end + 1);
             if (Buffer.byteLength(line) > maxRecordBytes) throw failure();
-            if (line.trim()) { parser.observe(JSON.parse(line)); committed = true; }
+            if (line.trim()) {
+              const record = JSON.parse(line);
+              parser.observe(record);
+              if (parser.isVerified()) turns.observe(record);
+              committed = true;
+            }
           }
           if (Buffer.byteLength(pending) > maxRecordBytes) throw failure();
         }
@@ -45,9 +53,11 @@ export function createSessionFileObserver(path, options) {
       options.signal?.throwIfAborted();
       if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1 || !sameFile(after, opened) || after.size < offset) throw failure();
     } finally { await file.close(); }
-    return committed ? parser.snapshot() : null;
+    const snapshot = committed ? parser.snapshot() : null;
+    committedTurn = turns.snapshot();
+    return snapshot;
   }
-  return () => {
+  const observe = () => {
     if (reading) return reading;
     reading = read().catch(error => {
       if (options.signal?.aborted) throw options.signal.reason ?? error;
@@ -55,6 +65,8 @@ export function createSessionFileObserver(path, options) {
     }).finally(() => { reading = null; });
     return reading;
   };
+  observe.turnState = () => committedTurn;
+  return observe;
 }
 
 export async function readSessionObservation(path, options) {

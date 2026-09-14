@@ -71,6 +71,30 @@ test('an already stopped watcher refuses even the initial file lookup', () => fi
   await assert.rejects(readSessionObservation(`${path}.missing`, { ...options, signal }), error => error === reason);
 }));
 
+test('turn state is exposed only after a complete verified file observation', () => fixture(async ({ path, options }) => {
+  const observe = createSessionFileObserver(path, options);
+  await observe();
+  assert.equal(observe.turnState(), null);
+  const turnId = '01900000-0000-7000-8000-000000000009';
+  await appendFile(path, JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } }) + '\n');
+  await observe();
+  const started = observe.turnState();
+  assert.equal(started.kind, 'run_started');
+  await appendFile(path, JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'PRIVATE' } }) + '\ninvalid\n');
+  await assert.rejects(observe());
+  assert.deepEqual(observe.turnState(), started);
+}));
+
+test('turn-like records before native session verification cannot become activity', () => fixture(async ({ path, options }) => {
+  await writeFile(path, JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: '01900000-0000-7000-8000-000000000009' } }) + '\n');
+  const observe = createSessionFileObserver(path, options);
+  assert.equal(await observe(), null);
+  assert.equal(observe.turnState(), null);
+  await appendFile(path, JSON.stringify({ type: 'session_meta', payload: { id: options.sessionId, cwd: options.cwd } }) + '\n');
+  await observe();
+  assert.equal(observe.turnState(), null);
+}));
+
 test('stop during an asynchronous scan discards its result and keeps the abort reason', () => fixture(async ({ path, options, content }) => {
   await writeFile(path, content + `${JSON.stringify({ type: 'message', text: 'private'.repeat(10000) })}\n`.repeat(100));
   const controller = new AbortController();

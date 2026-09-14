@@ -226,6 +226,9 @@ code and tool arguments are excluded. These observations do not add billing
 charges or update cost totals. `--once --report` only establishes the baseline.
 Unsent observations stay in the local outbox on stop. Invalid logs pause reporting;
 authentication failures stop the watcher. Quiet logs never imply an agent signed off.
+Codex also reports the latest explicit turn start, completion or abort after the
+baseline read. A turn finishing does not mark the session offline. Claude turn
+lifecycle reporting is not yet supported; its token observations remain available.
 
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
