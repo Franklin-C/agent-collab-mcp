@@ -225,7 +225,11 @@ recovery alone does not start the watcher for you after a crash.
 
 To observe an existing Codex or Claude Code session, add `--report --client
 codex|claude-code --session <UUID> --session-file <absolute-log-path> --cwd
-<absolute-repository-path>` to `watch`. The log must match that exact session and
+<absolute-repository-path> --state <absolute-private-directory>` to `watch`. Keep
+that same state directory when rotating a token: native queues are bound to the
+authenticated project and agent, so a replacement credential replays the same
+pending events. Reporting requires the server's `/api/agent/identity` endpoint;
+update the server first if the identity check is unavailable. The log must match that exact session and
 repository. The first read establishes a baseline; subsequent reads run every
 30 seconds and send changed session token totals to Runner activity. Prompts,
 code and tool arguments are excluded. These observations do not add billing

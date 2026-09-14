@@ -10,7 +10,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSy
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, isAbsolute } from "node:path";
 
 import { checkUpdate } from "./update-check.mjs";
 import { supervise } from "./supervisor.mjs";
@@ -202,6 +202,7 @@ async function watch() {
   const base = host();
   const token = process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error("Set AGENT_COLLAB_TOKEN before running watch.");
+  if (flags.report === 'true' && (!flags.state || !isAbsolute(flags.state))) throw new Error('watch --report requires --state <absolute private directory>; reuse it after rotating credentials.');
   const identity = createHash("sha256").update(`${base}:${token}`).digest("hex").slice(0, 20);
   const directory = flags.state ?? join(homedir(), ".agent-collab", "watch", identity);
   mkdirSync(directory, { recursive: true });
@@ -302,7 +303,7 @@ async function watch() {
     }
   } while (flags.once !== "true" && !cancellation.signal.aborted);
   } catch (error) {
-    if (connection.state !== 'stopped') status({ state: 'stopped', reason: flags.report === 'true' && !observations ? 'reporting_configuration_required' : 'request_failed', next_retry_at: null });
+    if (connection.state !== 'stopped') status({ state: 'stopped', reason: [401, 403].includes(error.status) ? 'authentication_required' : flags.report === 'true' && !observations ? 'reporting_configuration_required' : 'request_failed', next_retry_at: null });
     throw error;
   } finally {
     cancellation.abort();

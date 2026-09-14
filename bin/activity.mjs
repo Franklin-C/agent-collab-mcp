@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { activityConnectionScope } from './connection-identity.mjs';
 
 const kinds = new Set(['run_started', 'run_finished', 'run_failed', 'run_stopped', 'tool_started', 'tool_finished', 'file_changed', 'usage_reported', 'workspace_observed', 'needs_permission', 'needs_authentication', 'waiting', 'waiting_review', 'waiting_dependency']);
 const families = new Set(['command', 'file', 'mcp', 'search', 'other']);
@@ -33,7 +34,9 @@ export function createActivityReporter(options) {
   const server = new URL(options.server);
   if (server.protocol !== 'https:' && !(server.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(server.hostname))) throw new Error('Activity reporting requires HTTPS or a loopback development server.');
   if (!options.token || !options.statePath || server.username || server.password) throw new Error('Activity reporting requires a token, safe server URL and private state path.');
-  const scope = createHash('sha256').update(`${server.origin}:${options.token}`).digest('hex');
+  // Only callers that authenticated this identity may opt into token rotation.
+  // Existing worker state retains its credential-bound scope until migrated.
+  const scope = activityConnectionScope(server.origin, options.token, options.connectionIdentity);
   const now = options.now ?? Date.now;
   const maxPending = options.maxPending ?? 512;
   if (!Number.isInteger(maxPending) || maxPending < 1 || maxPending > 512) throw new Error('Activity outbox capacity must be between 1 and 512.');

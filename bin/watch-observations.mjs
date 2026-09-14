@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createActivityReporter } from './activity.mjs';
 import { createSessionFileObserver } from './session-observation-file.mjs';
 import { createSessionActivityRecorder } from './session-activity.mjs';
+import { readConnectionIdentity } from './connection-identity.mjs';
 
 /** Passive native observations, never billable usage or permission to run a model. */
 export async function startWatchObservations(options) {
@@ -16,10 +17,11 @@ export async function startWatchObservations(options) {
   let lastTurn = JSON.stringify(observe.turnState());
   let lastWorkspace = JSON.stringify(observe.workspaceMetadata());
   signal.throwIfAborted();
+  const connectionIdentity = await readConnectionIdentity({ server, token, signal });
   const controller = new AbortController();
   const stop = () => controller.abort();
   signal.addEventListener('abort', stop, { once: true });
-  const scope = createHash('sha256').update(`${new URL(server).origin}:${token}:${client}:${sessionId}`).digest('hex');
+  const scope = createHash('sha256').update(JSON.stringify([new URL(server).origin, connectionIdentity.projectId, connectionIdentity.agentId, client, sessionId.toLowerCase()])).digest('hex');
   let reporter;
   const status = (state, reason) => options.onStatus?.({ state, ...(reason ? { reason } : {}), ...(observe.workspaceMetadata() ? { native_workspace: observe.workspaceMetadata() } : {}) });
   const fail = error => {
@@ -31,7 +33,7 @@ export async function startWatchObservations(options) {
     } else status('retrying', 'delivery_unavailable');
   };
   try {
-    reporter = createActivityReporter({ server, token, statePath: join(directory, `observations-${scope.slice(0, 20)}.json`), signal: controller.signal,
+    reporter = createActivityReporter({ server, token, connectionIdentity, statePath: join(directory, `observations-${scope.slice(0, 20)}.json`), signal: controller.signal,
       onError: error => fail(error.permanent ? error : Object.assign(error, { retryable: true })) });
     const recorder = createSessionActivityRecorder({ client, sessionId, connectionScope: scope, reporter });
     recorder.record(baseline);

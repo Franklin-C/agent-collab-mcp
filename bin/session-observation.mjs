@@ -36,7 +36,8 @@ export function createSessionObservationParser(client, { sessionId, cwd, platfor
     || typeof cwd !== 'string') fail();
   const models = new Map(), messages = new Map();
   const turnModels = new Map(), responses = new Map();
-  let verified = false, model = null, previous = zero(), nativeRecords = false;
+  const aggregateTurns = new Set();
+  let verified = false, model = null, currentTurn = null, previous = zero(), nativeRecords = false;
   const totalsFor = name => {
     if (!models.has(name)) { if (models.size >= 64) fail(); models.set(name, zero()); }
     return models.get(name);
@@ -50,10 +51,14 @@ export function createSessionObservationParser(client, { sessionId, cwd, platfor
       } else if (record.type === 'turn_context') {
         if (!verified || !validModel(record.payload?.model) || record.payload.cwd && !sameDirectory(record.payload.cwd, cwd, platform)) fail();
         model = record.payload.model;
+        currentTurn = typeof record.payload.turn_id === 'string' ? record.payload.turn_id : null;
         if (typeof record.payload.turn_id === 'string') turnModels.set(record.payload.turn_id, model);
       } else if (record.type === 'token_usage_record') {
         const payload = record.payload, responseModel = turnModels.get(payload?.turn_id);
         if (!verified || payload?.thread_id !== sessionId || !responseModel || typeof payload.response_id !== 'string' || !payload.response_id || payload.response_id.length > 200) fail();
+        // An aggregate already accepted for this turn may include this response.
+        // Without a common response boundary, adding or subtracting it guesses.
+        if (aggregateTurns.has(payload.turn_id)) throw new Error('Native usage overlaps an aggregate already observed for this turn. Reporting paused.');
         const current = counters(payload.usage, client), stamp = JSON.stringify([responseModel, current]);
         const prior = responses.get(payload.response_id);
         if (prior !== undefined && prior !== stamp) fail();
@@ -66,6 +71,7 @@ export function createSessionObservationParser(client, { sessionId, cwd, platfor
         if (!verified || !model) fail();
         const current = counters(record.payload.info.total_token_usage, client), delta = zero();
         for (const field of fields) { delta[field] = current[field] - previous[field]; if (!validCount(delta[field])) fail(); }
+        if (currentTurn && fields.some(field => delta[field] > 0)) aggregateTurns.add(currentTurn);
         add(totalsFor(model), delta);
         previous = current;
       }

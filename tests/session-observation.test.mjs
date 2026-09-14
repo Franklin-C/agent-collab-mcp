@@ -50,3 +50,14 @@ test('uses current Codex per-response records once across resumed UI counter res
 test('rejects native records belonging to another thread', () => {
   assert.throws(() => parseSessionObservation('codex', [meta('/repo'), { type: 'token_usage_record', payload: { thread_id: 'foreign' } }], { sessionId, cwd: '/repo', platform: 'linux' }));
 });
+
+test('does not add per-response usage to an aggregate from the same turn', () => {
+  const turn = { type: 'turn_context', payload: { cwd: '/repo', model: 'gpt-6', turn_id: 'same-turn' } };
+  const native = { type: 'token_usage_record', payload: { thread_id: sessionId, turn_id: 'same-turn', response_id: 'response', usage: usage(10, 2) } };
+  const options = { sessionId, cwd: '/repo', platform: 'linux' };
+  assert.throws(() => parseSessionObservation('codex', [meta('/repo'), turn, tokens(usage(10, 2)), native], options), /overlaps an aggregate/);
+  // The normal native-first ordering still ignores its mirrored UI aggregate.
+  const rows = parseSessionObservation('codex', [meta('/repo'), turn, native, tokens(usage(10, 2))], options);
+  assert.equal(rows[0].input_tokens, 10);
+  assert.equal(rows[0].output_tokens, 2);
+});

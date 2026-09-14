@@ -10,6 +10,14 @@ import { createHash } from 'node:crypto';
 import { createActivityReporter } from '../bin/activity.mjs';
 
 const cli = fileURLToPath(new URL("../bin/agent-collab-mcp.mjs", import.meta.url));
+test('native reporting requires an explicit absolute state directory', () => {
+  for (const args of [[], ['--state', 'relative-state']]) {
+    assert.throws(() => execFileSync(process.execPath, [cli, 'watch', '--host', 'http://127.0.0.1:1', '--report', ...args], {
+      env: { ...process.env, AGENT_COLLAB_TOKEN: 'fixture-token' }, timeout: 5000, stdio: 'pipe',
+    }), error => error.status === 1 && /requires --state <absolute private directory>/.test(error.stderr.toString()));
+  }
+});
+
 test('watch exits when its recovery parent disconnects', async () => {
   await fixture((_request, _response, _directory, child) => child.disconnect(), ({ code, status }) => {
     assert.equal(code, 143);
@@ -60,9 +68,16 @@ test('watch recovery does not retry rejected credentials', async () => {
   }, ['--keep-alive']);
 });
 
-async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false) {
+async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false, identityStatus = 200) {
   const directory = mkdtempSync(join(tmpdir(), "ehgi-watch-test-"));
-  const server = createServer((request, response) => handle(request, response, directory, child));
+  const server = createServer((request, response) => {
+    if (request.url === '/api/agent/identity') {
+      assert.equal(request.headers.authorization, 'Bearer test-secret-never-in-status');
+      response.writeHead(identityStatus).end(JSON.stringify({ project_id: 'fixture-project', agent_id: 'fixture-agent' }));
+      return;
+    }
+    return handle(request, response, directory, child);
+  });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const child = spawn(process.execPath, [cli, "watch", "--host", base, "--state", directory, ...(typeof args === 'function' ? args(directory, base) : args)], {
@@ -233,6 +248,20 @@ test('watch --report refuses missing session identity before any network request
   }, ['--report']);
 });
 
+test('native watch stops before activity delivery when identity authentication fails', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(500).end(); }, ({ code, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 0);
+    assert.equal(status.reason, 'authentication_required');
+  }, directory => {
+    const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+    const file = join(directory, 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: directory } })}\n`);
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  }, 15000, false, 401);
+});
+
 test('restarted native watch replays the exact persisted observation before collecting new work', async () => {
   const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
   let original, received, pendingWatch;
@@ -248,9 +277,10 @@ test('restarted native watch replays the exact persisted observation before coll
     assert.deepEqual(received, { runtimeId: original.runtimeId, events: original.pending });
   }, (directory, server) => {
     const token = 'test-secret-never-in-status';
-    const scope = createHash('sha256').update(`${server}:${token}:codex:${sessionId}`).digest('hex');
+    const connectionIdentity = { projectId: 'fixture-project', agentId: 'fixture-agent' };
+    const scope = createHash('sha256').update(JSON.stringify([server, connectionIdentity.projectId, connectionIdentity.agentId, 'codex', sessionId])).digest('hex');
     const statePath = join(directory, `observations-${scope.slice(0, 20)}.json`);
-    const prior = createActivityReporter({ server, token, statePath });
+    const prior = createActivityReporter({ server, token, statePath, connectionIdentity });
     prior.record({ kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session' }, { runId: sessionId });
     prior.stop(); // Models interruption with an unacknowledged disk outbox.
     original = JSON.parse(readFileSync(statePath, 'utf8'));
