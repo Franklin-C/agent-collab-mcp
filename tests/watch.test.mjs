@@ -101,7 +101,8 @@ test('watch --report uploads changed native session counters without billing or 
     if (request.url === '/api/agent/activity') {
       const packet = JSON.parse(text); packets.push(packet);
       response.end(JSON.stringify({ acceptedThrough: packet.events.at(-1).sequence }));
-      pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+      if (packets.length === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(300))}\n`);
+      pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: packets.length === 2 }));
     } else if (request.url === '/api/agent/watch') {
       watchCalls++;
       assert.equal(JSON.parse(text).task_id, 'task_83');
@@ -116,7 +117,7 @@ test('watch --report uploads changed native session counters without billing or 
     assert.equal(status.mode, 'events_with_observations');
     assert.equal(status.automatic_client_resume, false);
     assert.equal(status.reason, 'stop_requested');
-    assert.equal(packets.length, 1);
+    assert.equal(packets.length, 2);
     assert.deepEqual(packets[0].events.map(event => event.kind), ['usage_reported', 'run_finished']);
     const { kind, inputTokens, outputTokens, usageScope, runId } = packets[0].events[0];
     assert.deepEqual({ kind, inputTokens, outputTokens, usageScope, runId }, { kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId });
@@ -125,6 +126,10 @@ test('watch --report uploads changed native session counters without billing or 
     assert.equal(packets[0].events[0].taskId, undefined, 'session totals must not be attributed to the current task');
     const visibleUsage = packets[0].events.find(event => event.kind === 'usage_reported' && event.runId === latest.runId);
     assert.equal(visibleUsage?.inputTokens, 200, 'turn completion must retain usage for the same native activity stream');
+    assert.deepEqual(packets[1].events.map(event => event.kind), ['usage_reported', 'run_finished'], 'late provider counters must not replace the completed state');
+    assert.equal(packets[1].events[0].inputTokens, 300);
+    assert.equal(packets[1].events[0].taskId, undefined);
+    assert.equal(packets[1].events.at(-1).runId, sessionId);
     assert(!JSON.stringify(packets).includes('PRIVATE'));
   }, directory => {
     const file = join(directory, 'session.jsonl');
@@ -135,7 +140,7 @@ test('watch --report uploads changed native session counters without billing or 
       { type: 'message', text: 'PRIVATE' }, usage(100),
     ].map(row => JSON.stringify(row)).join('\n') + '\n');
     return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory, '--task', 'task_83', '--lease', '5'];
-  }, 45000);
+  }, 85000);
 });
 
 test('watch --report refuses missing session identity before any network request', async () => {

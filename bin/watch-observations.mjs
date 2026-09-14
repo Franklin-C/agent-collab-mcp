@@ -49,7 +49,9 @@ export async function startWatchObservations(options) {
         // lifecycle and counters together: the hub selects usage by runId.
         // The turn identity above still detects distinct turns of the same kind.
         const taskId = options.currentTask?.();
-        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
+        // Provider counters may arrive in a later scan than task_complete.
+        // Restore the explicit state after those counters as well.
+        if (turn && (turnKey !== lastTurn || accepted) && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });
