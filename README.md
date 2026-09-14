@@ -215,7 +215,13 @@ On restart, the watcher recovers its structured lock only when the connection
 identity matches and the previous process is confirmed absent. It then resumes
 the saved cursor and pending observations. Live or inaccessible owners, older
 numeric locks, and interrupted acquisition guards remain untouched and require
-inspection. This recovery does not start the watcher for you after a crash.
+inspection. Add `--keep-alive` to explicitly start a small parent process that
+restarts a crashed watch child, at most three times with 1, 4 and 15 second delays.
+It retains the same connection, state directory and exact session arguments.
+Normal completion, hub Stop, authentication/configuration errors, lost leases and
+interrupts are terminal. Losing the parent stops its child. This parent never
+runs a model and does not survive a machine restart; without this option, lock
+recovery alone does not start the watcher for you after a crash.
 
 To observe an existing Codex or Claude Code session, add `--report --client
 codex|claude-code --session <UUID> --session-file <absolute-log-path> --cwd

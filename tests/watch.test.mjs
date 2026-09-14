@@ -10,6 +10,49 @@ import { createHash } from 'node:crypto';
 import { createActivityReporter } from '../bin/activity.mjs';
 
 const cli = fileURLToPath(new URL("../bin/agent-collab-mcp.mjs", import.meta.url));
+test('watch recovery replaces a crashed child and recovers its owned lock', async () => {
+  let calls = 0, crashedPid;
+  await fixture((_request, response, directory) => {
+    calls++;
+    const pid = JSON.parse(readFileSync(join(directory, 'status.json'), 'utf8')).pid;
+    if (calls === 1) {
+      crashedPid = pid;
+      // This PID belongs to the child created by this isolated fixture.
+      process.kill(pid, 'SIGKILL');
+      response.destroy();
+    } else {
+      assert.notEqual(pid, crashedPid);
+      response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+    }
+  }, ({ code, stderr, status }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(calls, 2);
+    assert.equal(status.reason, 'stop_requested');
+    assert.match(stderr, /recovery 1\/3/);
+  }, ['--keep-alive']);
+});
+
+test('watch recovery respects a hub Stop without restarting', async () => {
+  let calls = 0;
+  await fixture((_request, response) => {
+    calls++;
+    response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+  }, ({ code, status }) => {
+    assert.equal(code, 0);
+    assert.equal(calls, 1);
+    assert.equal(status.reason, 'stop_requested');
+  }, ['--keep-alive']);
+});
+
+test('watch recovery does not retry rejected credentials', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(401).end(); }, ({ code, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 1);
+    assert.equal(status.reason, 'authentication_required');
+  }, ['--keep-alive']);
+});
+
 async function fixture(handle, verify, args = [], timeoutMs = 15000) {
   const directory = mkdtempSync(join(tmpdir(), "ehgi-watch-test-"));
   const server = createServer((request, response) => handle(request, response, directory));

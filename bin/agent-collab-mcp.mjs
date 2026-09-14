@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { checkUpdate } from "./update-check.mjs";
 import { supervise } from "./supervisor.mjs";
 import { startWatchObservations } from "./watch-observations.mjs";
+import { recoverWatch } from "./watch-recovery.mjs";
 import { createWatchTaskContext } from "./watch-task-context.mjs";
 import { acquireWorkerLock } from "./worker-lock.mjs";
 import { setTimeout as watchDelay } from "node:timers/promises";
@@ -24,7 +25,7 @@ const flags = {};
 const positional = [];
 const BOOLEAN_FLAGS = new Set([
   "print", "write", "once", "apply", "configure", "start", "install", "uninstall",
-  "reset-recovery", "verify-github", "retry-failed", "report", "resume",
+  "reset-recovery", "verify-github", "retry-failed", "report", "resume", "keep-alive",
 ]);
 
 for (let index = 0; index < rest.length; index += 1) {
@@ -57,7 +58,7 @@ function usage(code = 0) {
   cleanup --repo <repo> --state <worker-state> [--base main] [--verify-github] [--apply]
   worker --host <url> --client codex|claude-code|gemini-cli --repo <approved-repo> --write [--model <model>] [--profile <codex-profile>] [--once]
   supervise --host <url> --client codex|claude-code|gemini-cli [--cwd <repo>] [--write] [--retry-failed]
-  watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once]
+  watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once] [--keep-alive]
         [--report --client codex|claude-code --session <UUID> --session-file <absolute path> --cwd <absolute repo>]
         --report sends session token observations, not billable usage; it never resumes a model
   doctor --host <url> [--client <name>] [--report] check connection/config (reads AGENT_COLLAB_TOKEN;
@@ -230,7 +231,12 @@ async function watch() {
   const terminate = () => stop('terminated', 143);
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", terminate);
-  status({ reason: null, next_retry_at: null });
+  // A recovery parent owns this child. Losing that parent must not orphan it.
+  if (process.send) {
+    process.once('disconnect', terminate);
+    if (!process.connected) terminate();
+  }
+  if (!cancellation.signal.aborted) status({ reason: null, next_retry_at: null });
   const cursorFile = join(directory, "cursor.json");
   let cursor = readJson(cursorFile).seq ?? Number(flags.since ?? 0);
   if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Invalid watch cursor.");
@@ -239,6 +245,7 @@ async function watch() {
   let failures = 0;
   let observations;
   try {
+  if (cancellation.signal.aborted) return;
   if (flags.report === 'true') {
     observations = await startWatchObservations({ client: flags.client, sessionId: flags.session, sessionFile: flags['session-file'], cwd: flags.cwd,
       server: base, token, directory, signal: cancellation.signal, currentTask: () => taskContext.current(),
@@ -301,6 +308,7 @@ async function watch() {
     cancellation.abort();
     await observations?.close();
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', terminate);
+    process.removeListener('disconnect', terminate);
   }
 }
 
@@ -506,9 +514,24 @@ switch (command) {
     if (flags.phase && !["coordination", "implementation", "review"].includes(flags.phase)) throw new Error("--phase must be coordination, implementation, or review.");
     await supervise({ phase: flags.phase, host: host(), client: flags.client, cwd: flags.cwd, state: flags.state, write: flags.write === "true", retryFailed: flags["retry-failed"] === "true", resume: flags.resume === "true", task: flags.task, lease: flags.lease, model: flags.model, once: flags.once === "true" });
     break;
-  case "watch":
-    await watch();
+  case "watch": {
+    if (flags['keep-alive'] !== 'true') { await watch(); break; }
+    if (process.send) throw new Error('Nested watch recovery is not supported.');
+    const controller = new AbortController();
+    const interrupt = () => { process.exitCode = 130; controller.abort(); };
+    const terminate = () => { process.exitCode = 143; controller.abort(); };
+    process.once('SIGINT', interrupt); process.once('SIGTERM', terminate);
+    try {
+      const code = await recoverWatch(process.argv[1], ['watch', ...rest, '--keep-alive', 'false'], {
+        signal: controller.signal,
+        onRestart: ({ attempt, delay_ms }) => console.error(`Watch process exited unexpectedly; recovery ${attempt}/3 in ${delay_ms / 1000}s. No agent will be invoked.`),
+      });
+      process.exitCode ??= code;
+    } finally {
+      process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', terminate);
+    }
     break;
+  }
   case "doctor":
     await doctor();
     break;
@@ -526,3 +549,10 @@ switch (command) {
 }
 
 } catch (error) { console.error(error instanceof Error ? error.message : "Command failed."); process.exitCode = 1; }
+finally {
+  // Handled failures (including bad auth/configuration) are terminal, not crashes.
+  if (command === 'watch' && process.connected) {
+    await new Promise(resolve => process.send({ type: 'watch_terminal' }, () => resolve()));
+    if (process.connected) process.disconnect();
+  }
+}
