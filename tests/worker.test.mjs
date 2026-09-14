@@ -263,6 +263,21 @@ test('final provider usage is delivered after Stop without starting another paid
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
 });
 
+test('fresh assignments direct agents to the current General and GitHub workflow', async t => {
+  const f = executableFixture(t);
+  let deliveredPrompt;
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    deliveredPrompt = prompt;
+    return f.options.runClient(client, prompt, args);
+  } });
+  assert.match(deliveredPrompt, /Use General for task questions, decisions and suggestions/);
+  assert.match(deliveredPrompt, /Call get_briefing first, then get_inbox/);
+  assert.match(deliveredPrompt, /assignment task association/);
+  assert.match(deliveredPrompt, /channel and thread IDs returned by the hub/);
+  assert.match(deliveredPrompt, /GitHub Projects for task planning, GitHub issues for verified bugs/);
+  assert.doesNotMatch(deliveredPrompt, /use Plan for decisions|Improve for suggestions|memory for reusable discoveries/);
+});
+
 test('the final usage drain is bounded and preserves undelivered reports after Stop', async t => {
   const f = executableFixture(t), stop = new AbortController(), sent = [], originalTimeout = globalThis.setTimeout;
   t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 5000 ? 50 : ms, ...args));

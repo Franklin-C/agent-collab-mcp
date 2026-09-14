@@ -66,6 +66,25 @@ test('never drops queued events on invalid acknowledgements or capacity overflow
   assert.equal(state.pending.length, 1); assert.equal(state.nextSequence, 2); assert.equal(errors.length, 1);
 });
 
+test('an advanced acknowledgement never discards observations not yet transmitted', async t => {
+  let release;
+  const packets = [];
+  const options = setup(t, { fetch: async (_url, request) => {
+    packets.push(JSON.parse(request.body));
+    if (packets.length === 1) await new Promise(resolve => { release = resolve; });
+    return response(2);
+  } });
+  const reporter = createActivityReporter(options);
+  t.after(() => reporter.stop());
+  reporter.record({ kind: 'run_started' }, { runId: 'one' });
+  const pending = reporter.flush();
+  reporter.record({ kind: 'tool_started', tool: 'command' }, { runId: 'one' });
+  release();
+  await pending;
+  assert.deepEqual(packets.map(packet => packet.events.map(event => event.sequence)), [[1], [2]]);
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 0);
+});
+
 test('failed disk writes do not consume a sequence or publish an unaccepted observation', async t => {
   const packets = [];
   const options = setup(t, { fetch: async (_url, request) => {

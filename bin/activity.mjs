@@ -76,7 +76,10 @@ export function createActivityReporter(options) {
         const acknowledgement = await response.json();
         cancellation.signal.throwIfAborted();
         if (!Number.isSafeInteger(acknowledgement.acceptedThrough) || acknowledgement.acceptedThrough < events.at(-1).sequence || acknowledgement.acceptedThrough >= state.nextSequence) throw new Error('Invalid activity acknowledgement; pending events retained.');
-        persist({ ...state, pending: state.pending.filter(event => event.sequence > acknowledgement.acceptedThrough) });
+        // New observations can arrive while this request is in flight. A
+        // server high-water mark is not evidence those unsent events arrived.
+        // Remove only this transmitted batch; retries remain idempotent.
+        persist({ ...state, pending: state.pending.filter(event => event.sequence > events.at(-1).sequence) });
       }
       failures = 0; retryAt = 0;
     })().catch(error => {
