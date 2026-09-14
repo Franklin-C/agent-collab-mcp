@@ -20,7 +20,7 @@ export async function startWatchObservations(options) {
   signal.addEventListener('abort', stop, { once: true });
   const scope = createHash('sha256').update(`${new URL(server).origin}:${token}:${client}:${sessionId}`).digest('hex');
   let reporter;
-  const status = (state, reason) => options.onStatus?.({ state, ...(reason ? { reason } : {}) });
+  const status = (state, reason) => options.onStatus?.({ state, ...(reason ? { reason } : {}), ...(observe.workspaceMetadata() ? { native_workspace: observe.workspaceMetadata() } : {}) });
   const fail = error => {
     if (controller.signal.aborted) return;
     if (error.permanent || error.retryable !== true) {

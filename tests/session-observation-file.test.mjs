@@ -26,6 +26,24 @@ test('reads only verified totals and ignores an incomplete trailing append', () 
   assert.equal(reports[0].input_tokens, 100);
   assert.equal(JSON.stringify(reports).includes('PRIVATE'), false);
 }));
+
+test('native workspace metadata commits only complete validated scans and returns copies', () => fixture(async ({ path, options, cwd }) => {
+  const record = { type: 'assistant', sessionId, cwd, gitBranch: 'feature/a', message: { id: 'message', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', name: 'Edit', id: 'edit', input: { file_path: join(cwd, 'a.ts'), new_string: 'PRIVATE' } }] } };
+  await writeFile(path, JSON.stringify(record) + '\n');
+  const observe = createSessionFileObserver(path, { ...options, client: 'claude-code' });
+  await observe();
+  assert.deepEqual(observe.workspaceMetadata(), { branch: 'feature/a', files: [] });
+  const result = { type: 'user', sessionId, cwd, gitBranch: 'feature/a', message: { content: [{ type: 'tool_result', tool_use_id: 'edit', content: 'PRIVATE' }] } };
+  await appendFile(path, JSON.stringify(result) + '\n');
+  await observe();
+  const snapshot = observe.workspaceMetadata();
+  assert.deepEqual(snapshot, { branch: 'feature/a', files: ['a.ts'] });
+  snapshot.files.push('foreign');
+  assert.deepEqual(observe.workspaceMetadata().files, ['a.ts']);
+  await appendFile(path, JSON.stringify({ ...result, gitBranch: 'feature/b' }) + '\ninvalid\n');
+  await assert.rejects(observe());
+  assert.deepEqual(observe.workspaceMetadata(), { branch: 'feature/a', files: ['a.ts'] });
+}));
 test('rejects oversized individual records with bounded memory', () => fixture(async ({ path, options }) => {
   await assert.rejects(readSessionObservation(path, { ...options, maxRecordBytes: 1 }));
 }));
