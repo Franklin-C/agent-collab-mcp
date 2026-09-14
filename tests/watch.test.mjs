@@ -10,6 +10,13 @@ import { createHash } from 'node:crypto';
 import { createActivityReporter } from '../bin/activity.mjs';
 
 const cli = fileURLToPath(new URL("../bin/agent-collab-mcp.mjs", import.meta.url));
+test('watch exits when its recovery parent disconnects', async () => {
+  await fixture((_request, _response, _directory, child) => child.disconnect(), ({ code, status }) => {
+    assert.equal(code, 143);
+    assert.equal(status.reason, 'terminated');
+  }, [], 15000, true);
+});
+
 test('watch recovery replaces a crashed child and recovers its owned lock', async () => {
   let calls = 0, crashedPid;
   await fixture((_request, response, directory) => {
@@ -53,19 +60,20 @@ test('watch recovery does not retry rejected credentials', async () => {
   }, ['--keep-alive']);
 });
 
-async function fixture(handle, verify, args = [], timeoutMs = 15000) {
+async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false) {
   const directory = mkdtempSync(join(tmpdir(), "ehgi-watch-test-"));
-  const server = createServer((request, response) => handle(request, response, directory));
+  const server = createServer((request, response) => handle(request, response, directory, child));
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const child = spawn(process.execPath, [cli, "watch", "--host", base, "--state", directory, ...(typeof args === 'function' ? args(directory, base) : args)], {
     env: { ...process.env, AGENT_COLLAB_TOKEN: "test-secret-never-in-status" },
+    ...(ipc ? { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] } : {}),
   });
   let stderr = "";
   child.stderr.on("data", chunk => stderr += chunk);
   const timer = setTimeout(() => child.kill(), timeoutMs);
   try {
-    const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on("close", resolve); });
+    const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on(ipc ? "exit" : "close", resolve); });
     await verify({ code, stderr, directory, status: JSON.parse(readFileSync(join(directory, "status.json"), "utf8")) });
     assert.equal(existsSync(join(directory, "watch.lock")), false);
     assert(!readFileSync(join(directory, "status.json"), "utf8").includes("test-secret"));
