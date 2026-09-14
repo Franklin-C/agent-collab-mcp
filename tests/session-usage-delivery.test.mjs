@@ -5,13 +5,46 @@ import { createNativeUsageDelivery as create } from '../bin/session-usage-delive
 import { advanceSessionUsageWindow as advance } from '../bin/session-usage-window.mjs';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const options = { server: 'http://localhost', token: 'test-token', agentId: 'fixture-agent', source: 'client_json' };
+const options = { server: 'http://localhost', token: 'test-token', projectId: 'fixture-project', agentId: 'fixture-agent', source: 'client_json' };
 function report(connectionScope) {
   const identity = { client: 'codex', sessionId: '01a07a24-a447-75b3-890e-ceb683c31bfe', connectionScope };
   const row = n => ({ model: 'gpt-6-astra', token_semantics: 'inclusive', input_tokens: n, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 });
   return advance(advance(null, [row(10)], identity).state, [row(20)], identity).reports[0];
 }
 const ack = body => Response.json({ ok: true, duplicate: false, id: hash([options.agentId, body.event_id]).slice(0, 40) });
+
+test('token rotation preserves the baseline and retries the same pending report with fresh authorization', async () => {
+  const original = create(options);
+  let delivered;
+  const rotated = create({ ...options, token: 'replacement-token', fetch: async (_url, request) => {
+    assert.equal(request.headers.Authorization, 'Bearer replacement-token');
+    delivered = JSON.parse(request.body);
+    return ack(delivered);
+  } });
+  assert.equal(rotated.connectionScope, original.connectionScope);
+  const identity = { client: 'codex', sessionId: '01900000-0000-7000-8000-000000000001', connectionScope: original.connectionScope };
+  const row = input_tokens => ({ model: 'gpt-6-astra', token_semantics: 'inclusive', input_tokens, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 });
+  const baseline = advance(null, [row(100)], identity).state;
+  const beforeRotation = advance(baseline, [row(120)], identity);
+  const afterRotation = advance(beforeRotation.state, [row(130)], { ...identity, connectionScope: rotated.connectionScope });
+  assert.equal(afterRotation.reports[0].input_tokens, 30);
+  assert.equal(afterRotation.reports[0].session_id, beforeRotation.reports[0].session_id);
+  await rotated.deliver(beforeRotation.reports[0]);
+  assert.equal(delivered.event_id, beforeRotation.reports[0].event_id);
+  assert.equal(delivered.input_tokens, 20);
+});
+
+test('another project, agent, origin or accounting source cannot reuse a saved baseline', () => {
+  const original = create(options);
+  const identity = { client: 'codex', sessionId: '01900000-0000-7000-8000-000000000001', connectionScope: original.connectionScope };
+  const baseline = advance(null, [], identity).state;
+  for (const change of [{ projectId: 'another-project' }, { agentId: 'another-agent' }, { server: 'https://example.com' }, { source: 'cli_stream' }]) {
+    const connectionScope = create({ ...options, ...change }).connectionScope;
+    assert.notEqual(connectionScope, original.connectionScope);
+    assert.throws(() => advance(baseline, [], { ...identity, connectionScope }), /another observation/);
+  }
+  for (const projectId of [undefined, '', '../project', 'x'.repeat(129)]) assert.throws(() => create({ ...options, projectId }));
+});
 
 test('retries a transient failure with identical report and no private fields or client-side pricing', async () => {
   const sent = [], waits = [];

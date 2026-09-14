@@ -12,11 +12,13 @@ export function createNativeUsageDelivery(options) {
   if (server.username || server.password || server.search || server.hash || server.pathname !== '/'
     || server.protocol !== 'https:' && !(server.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(server.hostname))) throw invalid();
   if (typeof options.token !== 'string' || !options.token || /[\r\n]/.test(options.token)
+    || typeof options.projectId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(options.projectId)
     || typeof options.agentId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(options.agentId)
     || !['cli_stream', 'client_json'].includes(options.source)) throw invalid();
-  // Source is part of persisted identity: changing accounting buckets cannot
-  // silently reset server-side cumulative totals on an existing local outbox.
-  const connectionScope = hash([server.origin, options.token, options.agentId, options.source]);
+  // The caller must obtain project/agent identity from authenticated setup.
+  // Credentials authorize delivery; rotating one must not reset the baseline
+  // or abandon an unacknowledged report. Keep project and source boundaries.
+  const connectionScope = hash([server.origin, options.projectId, options.agentId, options.source]);
   return {
     connectionScope,
     async deliver(raw, cycleSignal) {

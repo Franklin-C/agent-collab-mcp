@@ -105,7 +105,7 @@ test('Stop interrupts an in-flight HTTP upload and retains its unacknowledged re
   const controller = new AbortController(), states = [];
   let began, calls = 0;
   const started = new Promise(resolve => { began = resolve; });
-  const transport = createNativeUsageDelivery({ server: 'http://localhost', token: 'fixture-token', agentId: 'fixture-agent', source: 'client_json',
+  const transport = createNativeUsageDelivery({ server: 'http://localhost', token: 'fixture-token', projectId: 'fixture-project', agentId: 'fixture-agent', source: 'client_json',
     fetch: async (_url, request) => {
       calls++; began();
       return await new Promise((_resolve, reject) => {
