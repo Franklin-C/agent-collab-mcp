@@ -12,6 +12,37 @@ function setup(t) { const dir=mkdtempSync(join(tmpdir(),'collab-supervisor-')); 
 const response = data => new Response(JSON.stringify(data),{status:200});
 test('idle watch never starts a model',async t=>{let turns=0;const r=await supervise({...setup(t),fetch:async()=>response({next_seq:8,events:[]}),runClient:async()=>{turns++;}});assert.equal(turns,0);assert.equal(r.cursor,8);});
 
+test('supervisor attaches the observed native session without replacing its accounting run', async t => {
+  const id = '01900000-0000-7000-8000-000000000001', reports = [];
+  await supervise({ ...setup(t), model: 'gpt-5', fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) { reports.push(JSON.parse(request.body)); return response({ ok: true }); }
+    return response({ next_seq: 1, events: [{ seq: 1 }] });
+  }, runClient: async (_client, _prompt, args) => {
+    args.onSession(id);
+    args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } });
+    return { sessionId: id, completed: true };
+  } });
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0].native_session, { client: 'codex', id });
+  assert.notEqual(reports[0].session_id, id);
+  assert.equal(reports[0].event_id, `${reports[0].session_id}-0`);
+});
+
+test('a fresh supervised invocation never borrows the previous native session identity', async t => {
+  const options = setup(t), reports = [], id = '01900000-0000-7000-8000-000000000001';
+  for (const sequence of [1, 2]) await supervise({ ...options, model: 'gpt-5', fetch: async (url, request) => {
+    if (url.endsWith('/api/usage/report')) { reports.push(JSON.parse(request.body)); return response({ ok: true }); }
+    return response({ next_seq: sequence, events: [{ seq: sequence }] });
+  }, runClient: async (_client, _prompt, args) => {
+    if (sequence === 1) args.onSession(id);
+    args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } });
+    return { completed: true };
+  } });
+  assert.equal(reports.length, 2);
+  assert.deepEqual(reports[0].native_session, { client: 'codex', id });
+  assert.equal(reports[1].native_session, undefined);
+});
+
 test('an already-stopped supervisor performs no watch and dispatches no client', async t => {
   const options = setup(t), controller = new AbortController(); controller.abort();
   let calls = 0, turns = 0;
@@ -64,7 +95,7 @@ test('MCP approval denial pauses immediately and retains events across restart',
   const state = JSON.parse(readFileSync(join(options.state, 'state.json')));
   assert.equal(state.pending.length, 1);
   assert.equal(state.failures, 3);
-  assert.equal(state.pauseReason, 'mcp_approval_required');
+  assert.equal(state.pauseReason, 'client_permission_required');
   await supervise({ ...options, fetch: async () => response({ next_seq: 1, events: [] }), runClient: blocked });
   assert.equal(turns, 1);
   await supervise({ ...options, retryFailed: true, fetch: async () => response({ next_seq: 1, events: [] }), runClient: async () => ({ sessionId: 'resolved-session' }) });
@@ -128,6 +159,25 @@ test('a completed Codex turn cannot acknowledge a structured MCP approval failur
   writeFileSync(executable, `console.log(${JSON.stringify(JSON.stringify(denied))});\nconsole.log('{"type":"turn.completed"}');\n`);
   await assert.rejects(runClient({ ...capability, executable }, 'fixture', { cwd: options.cwd, timeoutMs: 2000, spawn: (_command, args, opts) => spawn(process.execPath, [executable, ...args], opts) }), error => error.requiresApproval === true);
   assert.equal(readClientEvent(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: denied.item.error.message } })).requiresApproval, false);
+});
+test('Claude permission denials become typed approval failures', async t => {
+  const options = setup(t), denied = { type: 'result', subtype: 'error_max_turns', is_error: true, session_id: 'claude-session', permission_denials: [{ tool_name: 'Bash', tool_use_id: 'tool-1' }] };
+  const executable = join(options.cwd, 'claude-client');
+  writeFileSync(executable, `console.log(${JSON.stringify(JSON.stringify(denied))});\n`);
+  await assert.rejects(runClient({ ...capability, client: 'claude-code', executable }, 'fixture', { cwd: options.cwd, timeoutMs: 2000, spawn: (_command, args, opts) => spawn(process.execPath, [executable, ...args], opts) }), error => error.requiresApproval === true && error.sessionId === 'claude-session');
+  assert.equal(readClientEvent(JSON.stringify({ type: 'result', subtype: 'error_max_turns', is_error: true, permission_denials: [{ tool_name: 'Bash' }] }), 'claude-code').requiresApproval, true);
+});
+test('Claude can complete after an optional non-MCP permission denial', async t => {
+  const options = setup(t), completed = { type: 'result', subtype: 'success', is_error: false, session_id: 'claude-session', result: 'continued', permission_denials: [{ tool_name: 'Bash', tool_use_id: 'tool-1' }] };
+  const executable = join(options.cwd, 'claude-client');
+  writeFileSync(executable, `console.log(${JSON.stringify(JSON.stringify(completed))});\n`);
+  const result = await runClient({ ...capability, client: 'claude-code', executable }, 'fixture', { cwd: options.cwd, timeoutMs: 2000, spawn: (_command, args, opts) => spawn(process.execPath, [executable, ...args], opts) });
+  assert.equal(result.completed, true);
+  assert.equal(result.permissionDenials, 1);
+  assert.equal(readClientEvent(JSON.stringify({ ...completed, subtype: 'error_max_turns', is_error: false }), 'claude-code').requiresApproval, true);
+  assert.equal(readClientEvent(JSON.stringify({ ...completed, subtype: 'error_during_execution', is_error: true }), 'claude-code').requiresApproval, false);
+  assert.equal(readClientEvent(JSON.stringify({ ...completed, subtype: 'success', is_error: true }), 'claude-code').requiresApproval, false);
+  assert.equal(readClientEvent(JSON.stringify({ ...completed, permission_denials: [{ tool_name: 'mcp__agent-collab__get_briefing' }] }), 'claude-code').requiresApproval, true);
 });
 test('failed event survives restart and explicit resume uses the exact session',async t=>{const o={...setup(t),resume:true};await supervise({...o,fetch:async()=>response({next_seq:2,events:[{seq:2,text:'work'}]}),runClient:async(_c,_p,args)=>{args.onSession('session-123');throw new Error('offline')}});const s=JSON.parse(readFileSync(join(o.state,'state.json')));assert.equal(s.pending.length,1);assert.equal(s.cursor,2);let calls=0;await supervise({...o,fetch:async()=>response({next_seq:2,events:[]}),runClient:async(_c,p,args)=>{calls++;assert.equal(args.sessionId,'session-123');assert.match(p,/may be replayed/);return {sessionId:'session-123'}}});assert.equal(calls,1);assert.equal(JSON.parse(readFileSync(join(o.state,'state.json'))).pending.length,0);});
 test('poll continues while worker runs and stop aborts child',async t=>{const o=setup(t);let polls=0,aborted=false;await supervise({...o,once:false,fetch:async()=>{polls++;return response(polls===1?{next_seq:1,events:[{seq:1}]}:{stop_requested:true})},runClient:async(_c,_p,args)=>new Promise((_,reject)=>args.signal.addEventListener('abort',()=>{aborted=true;reject(new Error('stopped'))}))});assert.equal(polls,2);assert.equal(aborted,true);assert.equal(JSON.parse(readFileSync(join(o.state,'state.json'))).pending.length,1);});

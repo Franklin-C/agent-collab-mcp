@@ -123,6 +123,18 @@ function executableFixture(t, finishSucceeds = true) {
   return { ...f, sent, options, cwd: join(f.state, 'worktrees', 'coord-agent-1'), archive: join(f.state, 'handoffs', 'worker-coord-agent-1.json') };
 }
 
+test('Claude managed workers admit the MCP namespace for the assigned worktree', async t => {
+  const f = executableFixture(t);
+  let invocation;
+  await work({ ...f.options, model: undefined, capability: { client: 'claude-code', version: 'fixture', compatible: true }, runClient: async (_client, _prompt, args) => {
+    invocation = args;
+    args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } });
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(handoff));
+    return { completed: true };
+  } });
+  assert.deepEqual(invocation.allowedTools, ['mcp__agent-collab__*']);
+});
+
 test('coordination usage identifies its job reservation and acknowledged handoffs are archived before cleanup', async t => {
   const f = executableFixture(t); await work(f.options);
   const usage = f.sent.filter(item => item.url.endsWith('/api/usage/report'));
@@ -249,6 +261,34 @@ test('final provider usage is delivered after Stop without starting another paid
   const reports = f.sent.filter(item => item.url.endsWith('/api/usage/report'));
   assert.equal(reports.length, 1); assert.equal(reports[0].data.input_tokens, 13);
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
+});
+
+test('fresh assignments direct agents to the current General and GitHub workflow', async t => {
+  const f = executableFixture(t);
+  let deliveredPrompt;
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    deliveredPrompt = prompt;
+    return f.options.runClient(client, prompt, args);
+  } });
+  assert.match(deliveredPrompt, /Use General for task questions, decisions and suggestions/);
+  assert.match(deliveredPrompt, /Call get_briefing first with have_repo_playbook: true after reading AGENTS\.md, then get_inbox/);
+  assert.match(deliveredPrompt, /assignment task association/);
+  assert.match(deliveredPrompt, /channel and thread IDs returned by the hub/);
+  assert.match(deliveredPrompt, /GitHub Projects for task planning, GitHub issues for verified bugs/);
+  assert.doesNotMatch(deliveredPrompt, /use Plan for decisions|Improve for suggestions|memory for reusable discoveries/);
+});
+
+test('worker usage retains observed native session metadata without changing billing keys', async t => {
+  const f = executableFixture(t), id = '01900000-0000-7000-8000-000000000001';
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    args.onSession(id);
+    return f.options.runClient(client, prompt, args);
+  } });
+  const reports = f.sent.filter(item => item.url.endsWith('/api/usage/report')).map(item => item.data);
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0].native_session, { client: 'codex', id });
+  assert.equal(reports[0].session_id, 'worker-coord-agent-1');
+  assert.equal(reports[0].event_id, 'worker-coord-agent-1-0');
 });
 
 test('the final usage drain is bounded and preserves undelivered reports after Stop', async t => {
@@ -499,17 +539,21 @@ test('a continuing usage producer cannot postpone authority Stop until the outbo
 });
 
 function finalizingChildFixture(t, { reason = 'Task completed', expire = false, restrictive } = {}) {
-  const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : 'blocked' };
+  const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : reason === 'Task released by this worker' ? 'more_work' : 'blocked' };
   const executable = join(f.root, 'finalizing-child.cjs');
   writeFileSync(executable, `const {writeFileSync}=require('node:fs');
     console.log(JSON.stringify({type:'thread.started',thread_id:'01a08354-4c9d-7c90-becb-39b58bc8ca35'}));
     ${expire || restrictive ? 'setInterval(()=>{},1000);' : `setTimeout(()=>{writeFileSync('.ehgi-handoff.json',${JSON.stringify(JSON.stringify(output))});console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:3}}));},700);`}`);
   const originalInterval = globalThis.setInterval, originalTimeout = globalThis.setTimeout;
-  let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false;
-  // Compress only worker heartbeat/grace timers; the child is a real Node
+  let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false, expireGrace;
+  // Compress worker heartbeats; explicitly expire grace after a repeated pulse.
+  // The child is a real Node
   // process with its own real clock, filesystem handoff and structured output.
   t.mock.method(globalThis, 'setInterval', (callback, ms, ...args) => originalInterval(callback, ms === 20000 ? 80 : ms, ...args));
-  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => { if (ms === 30000) graceTimers++; return originalTimeout(callback, expire && ms === 30000 ? 250 : ms, ...args); });
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+    if (ms === 30000) { graceTimers++; if (expire) expireGrace = () => callback(...args); }
+    return originalTimeout(callback, ms, ...args);
+  });
   const options = { ...f.options,
     fetch: async (url, request) => {
       const data = JSON.parse(request.body), result = await f.options.fetch(url, request);
@@ -519,6 +563,7 @@ function finalizingChildFixture(t, { reason = 'Task completed', expire = false, 
       }
       if (data.action === 'heartbeat' && started) {
         terminalPulses++;
+        if (expire && terminalPulses === 2) originalTimeout(() => expireGrace(), 0);
         if (restrictive && terminalPulses > 1) return typeof restrictive === 'number' ? new Response(JSON.stringify({ error: 'Execution authorization or fence changed' }), { status: restrictive }) : response({ stop: true, reason: restrictive });
         return response({ stop: true, reason, leaseVersion: reason === 'Task completed' ? 7 : 8 });
       }
@@ -533,7 +578,7 @@ function finalizingChildFixture(t, { reason = 'Task completed', expire = false, 
   return { ...f, options, output, observed: () => ({ terminalPulses, graceTimers, cancelled }) };
 }
 
-for (const reason of ['Task completed', 'Task blocked pending new information']) test(`a real child can emit its final handoff and usage after ${reason}`, async t => {
+for (const reason of ['Task completed', 'Task blocked pending new information', 'Task released by this worker']) test(`a real child can emit its final handoff and usage after ${reason}`, async t => {
   const f = finalizingChildFixture(t, { reason }); await work(f.options);
   assert.deepEqual(f.sent.find(item => item.data.action === 'finish')?.data.handoff, f.output);
   assert.ok(f.observed().terminalPulses >= 1); assert.equal(f.observed().graceTimers, 1);
@@ -541,7 +586,7 @@ for (const reason of ['Task completed', 'Task blocked pending new information'])
   assert.deepEqual(JSON.parse(readFileSync(f.archive, 'utf8')).handoff, f.output);
 });
 
-test('repeated terminal heartbeats cannot extend a real child finalization deadline', async t => {
+test('repeated terminal heartbeats cannot extend a real child finalization deadline', { timeout: 10000 }, async t => {
   const f = finalizingChildFixture(t, { expire: true }); await work(f.options);
   assert.ok(f.observed().terminalPulses >= 2); assert.equal(f.observed().graceTimers, 1); assert.equal(f.observed().cancelled, true);
   const finish = f.sent.find(item => item.data.action === 'finish')?.data;

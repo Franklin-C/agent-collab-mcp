@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsS
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createUsageCollector } from './usage.mjs';
+import { nativeUsageSession } from './native-usage-session.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { inspectClient, runClient } from './client-adapters.mjs';
 import { createActivityReporter } from './activity.mjs';
@@ -63,6 +64,7 @@ export async function supervise(options) {
       const batch = state.pending.slice(0, 32);
       const turnId = randomUUID();
       let reportOrdinal = 0;
+      let observedSessionId = null;
       const collectUsage = createUsageCollector(capability.client, options.model);
       const packet = join(directory, 'active-events.json');
       writeFileSync(packet, JSON.stringify(batch, null, 2), { mode: 0o600 });
@@ -74,12 +76,13 @@ export async function supervise(options) {
         onUsage: event => {
           const reports = collectUsage(event);
           if (!reports.length) return;
-          state.usage.push(...reports.map(report => ({ ...report, event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
+          const nativeSession = nativeUsageSession(capability.client, event, observedSessionId);
+          state.usage.push(...reports.map(report => ({ ...report, ...(nativeSession ? { native_session: nativeSession } : {}), event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
           persist();
           void flushUsage();
         },
-        onSession: sessionId => { if (sessionId && state.sessionId !== sessionId) { state.sessionId = sessionId; persist(); } },
-      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log('Client turn completed.'); })
+        onSession: sessionId => { if (sessionId) observedSessionId = sessionId; if (sessionId && state.sessionId !== sessionId) { state.sessionId = sessionId; persist(); } },
+      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log(`Client turn completed.${result.permissionDenials ? ` ${result.permissionDenials} denied permission request(s) were recovered in-turn.` : ''}`); })
         .catch(error => {
           if (error.sessionId) state.sessionId = error.sessionId;
           if (error.usageRecoveryError || error.code === 'CODEX_USAGE_UNAVAILABLE') {
@@ -92,9 +95,9 @@ export async function supervise(options) {
           }
           if (error.requiresApproval) {
             state.failures = 3;
-            state.pauseReason = 'mcp_approval_required';
+            state.pauseReason = 'client_permission_required';
             persist();
-            log('MCP approval required. Paused with events retained; resolve approval with the operator before restarting with --retry-failed. No approval settings were changed.');
+            log('Client permission approval required. Paused with events retained; resolve the denied permission with the operator before restarting with --retry-failed. No approval settings were changed.');
             return;
           }
           state.failures += 1; persist(); log(`${error.message} Attempt ${state.failures}/3; ${state.failures >= 3 ? 'paused until --retry-failed' : 'retry on next poll'}.`);

@@ -8,6 +8,34 @@ import { createActivityReporter, safeActivity, clientActivity, clientUsageActivi
 import { capabilityContract, invocation, readClientDiagnostic, readClientEvent, resolveClientExecutable, runClient } from '../bin/client-adapters.mjs';
 
 const response = acceptedThrough => new Response(JSON.stringify({ acceptedThrough }));
+test('workspace activity permits only bounded relative filenames and strips content', () => {
+  const value = { kind: 'workspace_observed', workspace: { branch: 'feature/a', files: ['src/a.ts'], content: 'PRIVATE' }, text: 'PRIVATE' };
+  assert.deepEqual(safeActivity(value), { kind: 'workspace_observed', workspace: { branch: 'feature/a', files: ['src/a.ts'] } });
+  for (const file of ['/private', '../outside', 'src/../outside', 'C:/private', 'a\\b', 'a\nsecret', 'x'.repeat(513)]) assert.equal(safeActivity({ ...value, workspace: { branch: null, files: [file] } }), null);
+  assert.equal(safeActivity({ ...value, workspace: { branch: null, files: Array(51).fill('a') } }), null);
+  assert.equal(safeActivity({ ...value, workspace: { branch: null, files: Array(20).fill('文'.repeat(100)) } }), null);
+});
+
+test('an advanced acknowledgement does not discard events added during the request', async t => {
+  let release;
+  const packets = [];
+  const options = setup(t, { fetch: async (_url, request) => {
+    packets.push(JSON.parse(request.body));
+    if (packets.length === 1) await new Promise(resolve => { release = resolve; });
+    return response(2);
+  } });
+  const reporter = createActivityReporter(options);
+  try {
+    reporter.record({ kind: 'run_started' }, { runId: 'one' });
+    const pending = reporter.flush();
+    reporter.record({ kind: 'tool_started', tool: 'command' }, { runId: 'one' });
+    release();
+    await pending;
+    assert.deepEqual(packets.map(packet => packet.events.map(event => event.sequence)), [[1], [2]]);
+    assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 0);
+  } finally { await reporter.close(); }
+});
+
 function setup(t, extra = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ehgi-activity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -57,6 +85,92 @@ test('never drops queued events on invalid acknowledgements or capacity overflow
   await reporter.close().catch(() => {});
   const state = JSON.parse(readFileSync(options.statePath));
   assert.equal(state.pending.length, 1); assert.equal(state.nextSequence, 2); assert.equal(errors.length, 1);
+});
+
+test('failed disk writes do not consume a sequence or publish an unaccepted observation', async t => {
+  const packets = [];
+  const options = setup(t, { fetch: async (_url, request) => {
+    const packet = JSON.parse(request.body); packets.push(packet);
+    return response(packet.events.at(-1).sequence);
+  } });
+  const reporter = createActivityReporter(options);
+  const blockedTemp = `${options.statePath}.tmp`;
+  mkdirSync(blockedTemp);
+  assert.throws(() => reporter.record({ kind: 'tool_started' }, { runId: 'one' }));
+  assert.equal(JSON.parse(readFileSync(options.statePath)).nextSequence, 1);
+  // Even a later flush must not send a record whose durable write failed.
+  await reporter.flush();
+  assert.equal(packets.length, 0);
+  rmSync(blockedTemp, { recursive: true });
+  assert.equal(reporter.record({ kind: 'tool_started' }, { runId: 'one' }), true);
+  await reporter.close();
+  assert.equal(packets.length, 1);
+  assert.deepEqual(packets[0].events.map(event => event.sequence), [1]);
+});
+
+test('an acknowledgement disk failure retains the same pending sequence for retry', async t => {
+  const packets = [];
+  let block = true;
+  const options = setup(t, { fetch: async (_url, request) => {
+    const packet = JSON.parse(request.body); packets.push(packet);
+    if (block) mkdirSync(`${options.statePath}.tmp`);
+    return response(packet.events.at(-1).sequence);
+  } });
+  const reporter = createActivityReporter(options);
+  reporter.record({ kind: 'tool_started' }, { runId: 'one' });
+  await assert.rejects(reporter.flush());
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 1);
+  block = false;
+  rmSync(`${options.statePath}.tmp`, { recursive: true });
+  await reporter.close();
+  assert.equal(packets.length, 2);
+  assert.deepEqual(packets[1], packets[0]);
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 0);
+});
+
+test('operator cancellation aborts delivery and close never starts another upload', async t => {
+  const controller = new AbortController();
+  let calls = 0, requestSignal;
+  const options = setup(t, { signal: controller.signal, fetch: async (_url, request) => {
+    calls++; requestSignal = request.signal;
+    return new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }));
+  } });
+  const reporter = createActivityReporter(options);
+  reporter.record({ kind: 'tool_started' }, { runId: 'one' });
+  const pending = reporter.flush();
+  controller.abort();
+  await pending;
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(reporter.record({ kind: 'tool_finished' }, { runId: 'one' }), false);
+  await reporter.close(); await reporter.flush();
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 1);
+});
+
+test('an already aborted reporter cannot enqueue or flush persisted work', async t => {
+  const options = setup(t, { fetch: async () => { throw new Error('offline'); } });
+  const first = createActivityReporter(options);
+  first.record({ kind: 'tool_started' }, { runId: 'one' });
+  first.stop(); await first.close();
+  let calls = 0;
+  const restarted = createActivityReporter({ ...options, signal: AbortSignal.abort(), fetch: async () => { calls++; return response(1); } });
+  assert.equal(restarted.record({ kind: 'tool_finished' }, { runId: 'one' }), false);
+  await restarted.close();
+  assert.equal(calls, 0);
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 1);
+});
+
+for (const status of [400, 401, 403, 404, 409, 422]) test(`activity ${status} stops retries while preserving the pending outbox`, async t => {
+  let calls = 0;
+  const options = setup(t, { fetch: async () => { calls++; return new Response('{}', { status }); } });
+  const reporter = createActivityReporter(options);
+  reporter.record({ kind: 'tool_started' }, { runId: 'one' });
+  await assert.rejects(reporter.flush(), error => error.status === status && error.permanent);
+  assert.equal(reporter.record({ kind: 'tool_finished' }, { runId: 'one' }), false);
+  await assert.rejects(reporter.flush());
+  await assert.rejects(reporter.close());
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 1);
 });
 
 test('serializes overlapping flushes and preserves newly recorded events', async t => {
