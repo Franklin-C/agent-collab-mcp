@@ -252,7 +252,7 @@ async function watch() {
       const response = await fetch(`${base}/api/agent/watch`, {
         method: "POST", signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(55000)]),
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ since_seq: cursor, ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
+        body: JSON.stringify({ since_seq: cursor, ...(flags.report === 'true' ? { include_task_context: true } : {}), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
       });
       if ([400, 401, 403, 404, 409].includes(response.status)) {
         const reason = response.status === 401 || response.status === 403 ? "authentication_required" : response.status === 409 ? "lease_conflict" : "configuration_required";
@@ -268,7 +268,7 @@ async function watch() {
       if (cancellation.signal.aborted) return;
       if (!Number.isSafeInteger(result.next_seq) || result.next_seq < cursor || !Array.isArray(result.events)) throw new Error("Invalid watch response.");
       if (result.stop_requested) taskContext.clear();
-      else taskContext.confirm(requestStartedAt);
+      else taskContext.confirm(requestStartedAt, result.task_context);
       if (result.events.length) {
         // Durable spool precedes cursor advancement; replay can duplicate, never lose events.
         safeWrite(join(directory, `events-${cursor}-${result.next_seq}.json`), JSON.stringify(result), false);

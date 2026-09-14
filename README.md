@@ -229,7 +229,9 @@ authentication failures stop the watcher. Quiet logs never imply an agent signed
 Codex also reports the latest explicit turn start, completion or abort after the
 baseline read. A turn finishing does not mark the session offline. Claude turn
 lifecycle reporting is not yet supported; its token observations remain available.
-With `--task <id> --lease <version>`, new turn activity includes the task only
+On supporting servers, native reporting discovers the agent's current active,
+owned task without extra flags. This is observational only: it neither claims
+work nor renews the discovered lease. With `--task <id> --lease <version>`, new turn activity includes the task only
 after a successful watch confirmation. Failed or stale confirmations drop that
 context. Session token totals stay unassigned; they span more than one task.
 Reporting status also includes Claude's explicit branch and up to 50 files (4 KiB total)

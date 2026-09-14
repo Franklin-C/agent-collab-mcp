@@ -105,10 +105,10 @@ test('watch --report uploads changed native session counters without billing or 
       pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: packets.length === 2 }));
     } else if (request.url === '/api/agent/watch') {
       watchCalls++;
-      assert.equal(JSON.parse(text).task_id, 'task_83');
-      assert.equal(JSON.parse(text).lease_version, 5);
+      assert.equal(JSON.parse(text).include_task_context, true);
+      assert.equal(JSON.parse(text).task_id, undefined, 'automatic observation must not request lease renewal');
       if (watchCalls === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: '01900000-0000-7000-8000-000000000099', last_agent_message: 'PRIVATE' } })}\n`);
-      if (watchCalls === 1) { response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: false })); return; }
+      if (watchCalls === 1) { response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: false, task_context: { task_id: 'task_83', lease_version: 5, valid_for_ms: 55000 } })); return; }
       pendingWatch = response;
     } else { billingCalls++; response.writeHead(500).end(); }
   }, ({ code, stderr, status }) => {
@@ -139,7 +139,7 @@ test('watch --report uploads changed native session counters without billing or 
       { type: 'event_msg', payload: { type: 'task_started', turn_id: '01900000-0000-7000-8000-000000000099' } },
       { type: 'message', text: 'PRIVATE' }, usage(100),
     ].map(row => JSON.stringify(row)).join('\n') + '\n');
-    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory, '--task', 'task_83', '--lease', '5'];
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
   }, 85000);
 });
 
