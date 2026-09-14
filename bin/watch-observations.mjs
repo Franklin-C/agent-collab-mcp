@@ -14,6 +14,7 @@ export async function startWatchObservations(options) {
   const observe = createSessionFileObserver(sessionFile, { client, sessionId, cwd, signal });
   const baseline = await observe();
   let lastTurn = JSON.stringify(observe.turnState());
+  let lastWorkspace = JSON.stringify(observe.workspaceMetadata());
   signal.throwIfAborted();
   const controller = new AbortController();
   const stop = () => controller.abort();
@@ -41,6 +42,10 @@ export async function startWatchObservations(options) {
         const snapshot = await observe();
         controller.signal.throwIfAborted();
         const accepted = recorder.record(snapshot);
+        const workspace = observe.workspaceMetadata();
+        const workspaceKey = JSON.stringify(workspace);
+        const workspaceAccepted = workspace && workspaceKey !== lastWorkspace && reporter.record({ kind: 'workspace_observed', workspace }, { runId: sessionId });
+        if (workspaceAccepted) lastWorkspace = workspaceKey;
         // Publish the latest explicit turn state after usage so a completed
         // turn is not made to look active by its final token observation.
         const turn = observe.turnState();
@@ -51,7 +56,7 @@ export async function startWatchObservations(options) {
         const taskId = options.currentTask?.();
         // Provider counters may arrive in a later scan than task_complete.
         // Restore the explicit state after those counters as well.
-        if (turn && (turnKey !== lastTurn || accepted) && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
+        if (turn && (turnKey !== lastTurn || accepted || workspaceAccepted) && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });

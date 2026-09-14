@@ -143,6 +143,34 @@ test('watch --report uploads changed native session counters without billing or 
   }, 85000);
 });
 
+test('native Claude edit metadata reaches the activity endpoint without content or absolute paths', async () => {
+  const sessionId = '01900000-0000-7000-8000-000000000001';
+  let pending, received;
+  await fixture(async (request, response, directory) => {
+    let body = ''; for await (const chunk of request) body += chunk;
+    if (request.url === '/api/agent/watch') {
+      pending = response;
+      appendFileSync(join(directory, 'claude.jsonl'), JSON.stringify({ type: 'user', sessionId, cwd: directory, gitBranch: 'feature/a', message: { content: [{ type: 'tool_result', tool_use_id: 'edit', content: 'PRIVATE' }] } }) + '\n');
+    } else if (request.url === '/api/agent/activity') {
+      received = JSON.parse(body);
+      response.end(JSON.stringify({ acceptedThrough: received.events.at(-1).sequence }));
+      pending.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+    } else response.writeHead(500).end();
+  }, ({ code, stderr, directory }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(received.events.length, 1);
+    assert.equal(received.events[0].kind, 'workspace_observed');
+    assert.deepEqual(received.events[0].workspace, { branch: 'feature/a', files: ['a.ts'] });
+    assert.equal(received.events[0].taskId, undefined);
+    assert(!JSON.stringify(received).includes('PRIVATE'));
+    assert(!JSON.stringify(received).includes(directory));
+  }, directory => {
+    const file = join(directory, 'claude.jsonl');
+    writeFileSync(file, JSON.stringify({ type: 'assistant', sessionId, cwd: directory, gitBranch: 'feature/a', message: { id: 'message', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', name: 'Edit', id: 'edit', input: { file_path: join(directory, 'a.ts'), new_string: 'PRIVATE' } }] } }) + '\n');
+    return ['--report', '--client', 'claude-code', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  }, 45000);
+});
+
 test('watch --report refuses missing session identity before any network request', async () => {
   let calls = 0;
   await fixture((_request, response) => { calls++; response.writeHead(500).end(); }, ({ code, stderr, status }) => {

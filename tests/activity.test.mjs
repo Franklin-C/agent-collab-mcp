@@ -8,6 +8,13 @@ import { createActivityReporter, safeActivity, clientActivity, clientUsageActivi
 import { capabilityContract, invocation, readClientDiagnostic, readClientEvent, resolveClientExecutable, runClient } from '../bin/client-adapters.mjs';
 
 const response = acceptedThrough => new Response(JSON.stringify({ acceptedThrough }));
+test('workspace activity permits only bounded relative filenames and strips content', () => {
+  const value = { kind: 'workspace_observed', workspace: { branch: 'feature/a', files: ['src/a.ts'], content: 'PRIVATE' }, text: 'PRIVATE' };
+  assert.deepEqual(safeActivity(value), { kind: 'workspace_observed', workspace: { branch: 'feature/a', files: ['src/a.ts'] } });
+  for (const file of ['/private', '../outside', 'src/../outside', 'C:/private', 'a\\b', 'a\nsecret', 'x'.repeat(513)]) assert.equal(safeActivity({ ...value, workspace: { branch: null, files: [file] } }), null);
+  assert.equal(safeActivity({ ...value, workspace: { branch: null, files: Array(51).fill('a') } }), null);
+  assert.equal(safeActivity({ ...value, workspace: { branch: null, files: Array(20).fill('文'.repeat(100)) } }), null);
+});
 function setup(t, extra = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ehgi-activity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

@@ -31,3 +31,16 @@ test('foreign sessions, sidechains, unknown tools and escaping paths cannot repo
   codex.observe({ ...base, gitBranch: 'not-codex-metadata' });
   assert.equal(codex.snapshot(), null);
 });
+
+test('recent filenames stay within the shared UTF-8 storage budget', () => {
+  const state = createNativeWorkspaceMetadata('claude-code', { sessionId: 'session', cwd: '/repo', platform: 'linux' });
+  const base = { sessionId: 'session', cwd: '/repo', gitBranch: 'feature/a' };
+  for (let index = 0; index < 30; index++) {
+    state.observe({ ...base, type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Write', id: String(index), input: { file_path: `/repo/${'文'.repeat(100)}${index}.ts` } }] } });
+    state.observe({ ...base, type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: String(index) }] } });
+  }
+  const files = state.snapshot().files;
+  assert(files.length < 30);
+  assert(files.reduce((size, file) => size + Buffer.byteLength(file), 0) <= 4096);
+  assert(files.at(-1).endsWith('29.ts'));
+});

@@ -232,10 +232,12 @@ lifecycle reporting is not yet supported; its token observations remain availabl
 With `--task <id> --lease <version>`, new turn activity includes the task only
 after a successful watch confirmation. Failed or stale confirmations drop that
 context. Session token totals stay unassigned; they span more than one task.
-Local reporting status also includes Claude's explicit branch and up to 50
+Reporting status also includes Claude's explicit branch and up to 50 files (4 KiB total)
 repository-relative files from successful Edit/Write/MultiEdit results. Failed
-edits and paths outside the repository are excluded. This metadata is local only;
-website delivery is not yet implemented. Codex workspace metadata is unavailable
+edits and paths outside the repository are excluded. Changes after the baseline
+are queued as workspace observations for the website's Runner activity panel.
+This requires a server version supporting workspace observations; older servers
+reject the new event and pause reporting. Codex workspace metadata is unavailable
 when its log does not provide it; the watcher never guesses from a shared checkout.
 
 An event-only watcher does **not** resume a desktop conversation. A connected

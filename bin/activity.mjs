@@ -2,15 +2,22 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const kinds = new Set(['run_started', 'run_finished', 'run_failed', 'run_stopped', 'tool_started', 'tool_finished', 'file_changed', 'usage_reported', 'needs_permission', 'needs_authentication', 'waiting', 'waiting_review', 'waiting_dependency']);
+const kinds = new Set(['run_started', 'run_finished', 'run_failed', 'run_stopped', 'tool_started', 'tool_finished', 'file_changed', 'usage_reported', 'workspace_observed', 'needs_permission', 'needs_authentication', 'waiting', 'waiting_review', 'waiting_dependency']);
 const families = new Set(['command', 'file', 'mcp', 'search', 'other']);
 const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
 const validCount = value => Number.isSafeInteger(value) && value >= 0;
 
-/** Deliberately excludes prompts, tool arguments/results, paths, messages and credentials. */
+/** Excludes content and absolute paths; workspace observations allow bounded relative filenames. */
 export function safeActivity(raw) {
   if (!raw || !kinds.has(raw.kind)) return null;
   const event = { kind: raw.kind };
+  if (raw.kind === 'workspace_observed') {
+    const value = raw.workspace;
+    if (!value || !(value.branch === null || typeof value.branch === 'string' && value.branch.length > 0 && value.branch.length <= 200 && !/[\x00-\x20\x7f]/.test(value.branch))
+      || !Array.isArray(value.files) || value.files.length > 50 || value.files.some(file => typeof file !== 'string' || !file || file.length > 512 || file.startsWith('/') || /[\\:\x00-\x1f\x7f]/.test(file) || file.split('/').some(part => !part || part === '.' || part === '..'))) return null;
+    if (value.files.reduce((size, file) => size + Buffer.byteLength(file), 0) > 4096) return null;
+    event.workspace = { branch: value.branch, files: [...value.files] };
+  }
   if (families.has(raw.tool)) event.tool = raw.tool;
   if (['succeeded', 'failed'].includes(raw.result)) event.result = raw.result;
   if (raw.kind === 'usage_reported' && validCount(raw.inputTokens) && validCount(raw.outputTokens) && ['turn', 'run', 'session'].includes(raw.usageScope)) {

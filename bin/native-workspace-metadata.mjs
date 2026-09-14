@@ -12,7 +12,8 @@ export function createNativeWorkspaceMetadata(client, { sessionId, cwd, platform
     const absolute = path.resolve(cwd, value);
     const relative = path.relative(root, normalize(absolute));
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
-    return relative.split(path.sep).join('/');
+    const file = relative.split(path.sep).join('/');
+    return file.length <= 512 && !file.includes(':') && !file.includes('\\') ? file : null;
   }
   return {
     observe(record) {
@@ -32,7 +33,10 @@ export function createNativeWorkspaceMetadata(client, { sessionId, cwd, platform
         } else if (record.type === 'user' && part.type === 'tool_result') {
           const file = pending.get(part.tool_use_id);
           pending.delete(part.tool_use_id);
-          if (file && (part.is_error === undefined || part.is_error === false)) files = [...files.filter(value => value !== file), file].slice(-50);
+          if (file && (part.is_error === undefined || part.is_error === false)) {
+            files = [...files.filter(value => value !== file), file].slice(-50);
+            while (files.reduce((size, value) => size + Buffer.byteLength(value), 0) > 4096) files.shift();
+          }
         }
       }
     },
