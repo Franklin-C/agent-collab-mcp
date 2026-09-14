@@ -47,6 +47,25 @@ test('native workspace metadata commits only complete validated scans and return
 test('rejects oversized individual records with bounded memory', () => fixture(async ({ path, options }) => {
   await assert.rejects(readSessionObservation(path, { ...options, maxRecordBytes: 1 }));
 }));
+
+test('Codex filenames commit only after a complete identity-verified scan', () => fixture(async ({ path, options, cwd }) => {
+  const observe = createSessionFileObserver(path, options);
+  await observe();
+  const record = file => ({ type: 'event_msg', payload: { type: 'item_completed', thread_id: sessionId,
+    item: { type: 'FileChange', status: 'completed', changes: { [join(cwd, file)]: { type: 'update', unified_diff: 'PRIVATE' } } } } });
+  const line = JSON.stringify(record('a.ts'));
+  await appendFile(path, line.slice(0, -1));
+  await observe();
+  assert.equal(observe.workspaceMetadata(), null);
+  await appendFile(path, line.slice(-1) + '\n');
+  await observe();
+  assert.deepEqual(observe.workspaceMetadata(), { branch: null, files: ['a.ts'] });
+  const snapshot = observe.workspaceMetadata();
+  snapshot.files.push('foreign');
+  await appendFile(path, JSON.stringify(record('b.ts')) + '\n' + JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5', cwd: join(cwd, 'other') } }) + '\n');
+  await assert.rejects(observe());
+  assert.deepEqual(observe.workspaceMetadata(), { branch: null, files: ['a.ts'] });
+}));
 test('reads appended totals once and completes a partial record on the next observation', () => fixture(async ({ path, options }) => {
   const observe = createSessionFileObserver(path, options);
   assert.equal((await observe())[0].input_tokens, 100);

@@ -2,6 +2,47 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNativeWorkspaceMetadata } from '../bin/native-workspace-metadata.mjs';
 
+const codexFileChange = (changes, item = {}, event = {}) => ({ type: 'event_msg', payload: {
+  type: 'item_completed', thread_id: 'session', turn_id: 'turn',
+  item: { type: 'FileChange', id: 'edit', changes, status: 'completed', stdout: 'PRIVATE', stderr: 'PRIVATE', ...item }, ...event,
+} });
+
+for (const [platform, cwd, file] of [['linux', '/repo', '/repo/src/a.ts'], ['darwin', '/Users/dev/repo', '/Users/dev/repo/src/a.ts'], ['win32', 'Z:\\Repo', 'z:\\repo\\src\\a.ts']]) {
+  test(`${platform}: completed Codex file items expose only confined filenames`, () => {
+    const state = createNativeWorkspaceMetadata('codex', { sessionId: 'session', cwd, platform });
+    for (const type of ['add', 'update', 'delete']) {
+      state.observe(codexFileChange({ [file]: { type, unified_diff: 'PRIVATE', content: 'PRIVATE', move_path: null } }));
+      assert.deepEqual(state.snapshot(), { branch: null, files: ['src/a.ts'] });
+    }
+    assert(!JSON.stringify(state.snapshot()).includes('PRIVATE'));
+  });
+}
+
+test('Codex ignores foreign, unfinished, failed, unstructured and escaping file events', () => {
+  const state = createNativeWorkspaceMetadata('codex', { sessionId: 'session', cwd: '/repo', platform: 'linux' });
+  const changes = { '/repo/a.ts': { type: 'update' } };
+  for (const status of ['inProgress', 'failed', 'declined', undefined]) state.observe(codexFileChange(changes, { status }));
+  state.observe(codexFileChange(changes, {}, { thread_id: 'other' }));
+  state.observe(codexFileChange(changes, {}, { type: 'item_started' }));
+  state.observe(codexFileChange(changes, { type: 'CommandExecution' }));
+  state.observe(codexFileChange(['/repo/a.ts']));
+  for (const file of ['/other/private', '/repo/../outside', 'src/a.ts', '/repo/a\nsecret']) {
+    state.observe(codexFileChange({ [file]: { type: 'add' } }));
+  }
+  state.observe(codexFileChange({ '/repo/a.ts': { type: 'unknown' } }));
+  assert.equal(state.snapshot(), null);
+});
+
+test('Codex file history retains at most fifty recent unique paths', () => {
+  const state = createNativeWorkspaceMetadata('codex', { sessionId: 'session', cwd: '/repo', platform: 'linux' });
+  for (let i = 0; i < 60; i++) state.observe(codexFileChange({ [`/repo/${i}.ts`]: { type: 'add' } }));
+  assert.equal(state.snapshot().files.length, 50);
+  assert.equal(state.snapshot().files[0], '10.ts');
+  state.observe(codexFileChange({ '/repo/10.ts': { type: 'update' } }));
+  assert.equal(state.snapshot().files.at(-1), '10.ts');
+  assert.equal(state.snapshot().files.length, 50);
+});
+
 for (const [platform, cwd, file] of [['linux', '/repo', '/repo/src/a.ts'], ['darwin', '/Users/dev/repo', '/Users/dev/repo/src/a.ts'], ['win32', 'Z:\\Repo', 'z:\\repo\\src\\a.ts']]) {
   test(`${platform}: only completed native edits expose repository-relative paths`, () => {
     const state = createNativeWorkspaceMetadata('claude-code', { sessionId: 'session', cwd, platform });

@@ -107,7 +107,7 @@ version 1; configuration support does not imply unattended execution support.
 
 ## Assignment workers
 
-The host enables **Automatic assignments** in **Workforce → Workers**, with
+The host enables **Automatic assignments** in **Settings → Workforce → Workers**, with
 per-run time, reported-cost and attempt limits. Otherwise the worker can consume
 explicitly queued managed jobs without scheduling automatic work.
 
@@ -244,13 +244,15 @@ owned task without extra flags. This is observational only: it neither claims
 work nor renews the discovered lease. With `--task <id> --lease <version>`, new turn activity includes the task only
 after a successful watch confirmation. Failed or stale confirmations drop that
 context. Session token totals stay unassigned; they span more than one task.
-Reporting status also includes Claude's explicit branch and up to 50 files (4 KiB total)
-repository-relative files from successful Edit/Write/MultiEdit results. Failed
-edits and paths outside the repository are excluded. Changes after the baseline
-are queued as workspace observations for the website's Runner activity panel.
+Reporting status includes Claude's explicit branch and successful Edit/Write/MultiEdit
+filenames. Codex paginated logs can supply filenames through completed `FileChange`
+items; only their explicit absolute change-map paths are read, never diffs, commands
+or output. Both clients keep at most 50 repository-relative filenames (4 KiB total).
+Failed edits, unknown event formats and paths outside the repository are excluded.
+Changes after the baseline are queued for the website's Runner activity panel.
 This requires a server version supporting workspace observations; older servers
-reject the new event and pause reporting. Codex workspace metadata is unavailable
-when its log does not provide it; the watcher never guesses from a shared checkout.
+reject the new event and pause reporting. Codex branch changes and files omitted
+from its structured log remain unknown; the watcher never guesses from a shared checkout.
 
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
