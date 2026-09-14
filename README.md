@@ -250,6 +250,12 @@ when its log does not provide it; the watcher never guesses from a shared checko
 
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
+On supporting servers, `watch` marks its polls as passive: they refresh only the
+watcher timestamp, not the agent's session presence or last tool. Recent accepted
+native work observations refresh session presence; historical replay and waiting
+events do not. Legacy supervisors retain their existing presence behavior. This
+distinguishes a surviving watcher from an active session without treating a quiet
+log or a finished turn as logout.
 For unattended work, the operator must start a supported CLI worker or supervisor.
 
 The supervisor saves pending events before moving its cursor and checks stop,

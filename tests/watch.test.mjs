@@ -92,6 +92,7 @@ test("watch recovers from a transient failure, persists events before cursor, an
   let connectedStatus;
   await fixture(async (request, response, directory) => {
     let body = ""; for await (const chunk of request) body += chunk;
+    assert.equal(JSON.parse(body).passive, true);
     calls++;
     if (calls === 1) { response.writeHead(503, { "Retry-After": "3" }).end(); return; }
     if (calls === 2) {

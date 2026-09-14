@@ -259,7 +259,7 @@ async function watch() {
       const response = await fetch(`${base}/api/agent/watch`, {
         method: "POST", signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(55000)]),
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ since_seq: cursor, ...(flags.report === 'true' ? { include_task_context: true } : {}), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
+        body: JSON.stringify({ since_seq: cursor, passive: true, ...(flags.report === 'true' ? { include_task_context: true } : {}), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
       });
       if ([400, 401, 403, 404, 409].includes(response.status)) {
         const reason = response.status === 401 || response.status === 403 ? "authentication_required" : response.status === 409 ? "lease_conflict" : "configuration_required";
