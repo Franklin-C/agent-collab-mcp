@@ -117,6 +117,9 @@ test('watch --report uploads changed native session counters without billing or 
     assert.deepEqual(packets[0].events.map(event => event.kind), ['usage_reported', 'run_finished']);
     const { kind, inputTokens, outputTokens, usageScope, runId } = packets[0].events[0];
     assert.deepEqual({ kind, inputTokens, outputTokens, usageScope, runId }, { kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId });
+    const latest = packets[0].events.at(-1);
+    const visibleUsage = packets[0].events.find(event => event.kind === 'usage_reported' && event.runId === latest.runId);
+    assert.equal(visibleUsage?.inputTokens, 200, 'turn completion must retain usage for the same native activity stream');
     assert(!JSON.stringify(packets).includes('PRIVATE'));
   }, directory => {
     const file = join(directory, 'session.jsonl');

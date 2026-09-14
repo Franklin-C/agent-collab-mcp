@@ -45,7 +45,10 @@ export async function startWatchObservations(options) {
         // turn is not made to look active by its final token observation.
         const turn = observe.turnState();
         const turnKey = JSON.stringify(turn);
-        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: turn.runId })) lastTurn = turnKey;
+        // The native watch is one session-scoped activity stream. Keep its
+        // lifecycle and counters together: the hub selects usage by runId.
+        // The turn identity above still detects distinct turns of the same kind.
+        if (turn && turnKey !== lastTurn && reporter.record({ kind: turn.kind }, { runId: sessionId })) lastTurn = turnKey;
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });
