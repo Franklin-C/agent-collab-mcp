@@ -105,13 +105,18 @@ export function readClientEvent(line, client) {
     const raw = JSON.parse(line);
     const event = raw.msg ?? raw;
     const requiresUpdate = client === 'codex' && codexRequiresUpdate(raw.type === 'event_msg' ? raw.payload : event);
+    const permissionDenials = client === 'claude-code' && event.type === 'result' && Array.isArray(event.permission_denials) ? event.permission_denials : [];
+    const deniedMcpTool = permissionDenials.some(item => typeof item?.tool_name === 'string' && item.tool_name.startsWith('mcp__agent-collab__'));
+    const failedClaudeResult = event.type === 'result' && event.subtype === 'error_max_turns';
     const requiresApproval = event.type === 'item.completed' && event.item?.type === 'mcp_tool_call' && event.item.status === 'failed' &&
-      /^MCP tool call requires approval, but approval policy is never\.?$/.test(event.item.error?.message ?? '');
+      /^MCP tool call requires approval, but approval policy is never\.?$/.test(event.item.error?.message ?? '') ||
+      client === 'claude-code' && permissionDenials.length > 0 && (failedClaudeResult || deniedMcpTool);
     const authenticationHint = (!client || client === 'claude-code') && event.type === 'result' && typeof event.result === 'string' && /^Not logged in · Please run \/login\s*$/.test(event.result);
     const requiresAuthentication = authenticationHint && event.is_error === true;
     const sessionId = event.session_id ?? (event.type === 'thread.started' ? event.thread_id : null);
     return { sessionId: typeof sessionId === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(sessionId) ? sessionId : null,
       requiresApproval, requiresAuthentication, authenticationHint, requiresUpdate,
+      ...(permissionDenials.length ? { permissionDenials: permissionDenials.length } : {}),
       failed: requiresUpdate || requiresApproval || requiresAuthentication || event.is_error === true || event.type === 'error' || event.type === 'turn.failed' || (event.type === 'result' && (event.error != null || event.status === 'error')),
       completed: event.type === 'result' || event.type === 'turn.completed' || event.type === 'task_complete' };
   } catch { return { sessionId: null, failed: false, completed: false }; }
@@ -142,7 +147,7 @@ export async function runClient(capability, prompt, options = {}) {
   if (options.signal?.aborted) throw Object.assign(new Error('Client turn was cancelled before execution.'), { name: 'AbortError', retryable: false });
   return await new Promise((resolve, reject) => {
     const child = (options.spawn ?? spawn)(call.command, call.args, { cwd: options.cwd, env: options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
-    let buffer = '', diagnosticBuffer = '', sessionId = options.sessionId ?? null, failed = false, requiresApproval = false, requiresAuthentication = false, authenticationHint = false, completed = false, bytes = 0, settled = false;
+    let buffer = '', diagnosticBuffer = '', sessionId = options.sessionId ?? null, permissionDenials = 0, failed = false, requiresApproval = false, requiresAuthentication = false, authenticationHint = false, completed = false, bytes = 0, settled = false;
     let usageRecoveryError, sampleTimer, samplePending = false, exitTimer, timedOutAt;
     const ownedPid = child.pid;
     let stopRequested = false, groupGone = false, termination, terminationDone, escalationTimer, groupProbe;
@@ -203,6 +208,7 @@ export async function runClient(capability, prompt, options = {}) {
     const consume = (line) => {
       const parsed = readClientEvent(line, capability.client);
       requiresApproval ||= parsed.requiresApproval === true;
+      permissionDenials = Math.max(permissionDenials, parsed.permissionDenials ?? 0);
       requiresAuthentication ||= parsed.requiresAuthentication === true;
       requiresUpdate ||= parsed.requiresUpdate === true;
       authenticationHint ||= parsed.authenticationHint === true;
@@ -260,7 +266,7 @@ export async function runClient(capability, prompt, options = {}) {
       else if (timedOutAt) reject(Object.assign(new Error(`${timeoutMessage}${requiresUpdate ? ` ${clientUpdateMessage}` : ''}`), { code: 'CLIENT_TIMEOUT', retryable: false, sessionId, requiresApproval, requiresAuthentication, ...(requiresUpdate ? { requiresUpdate: true } : {}), ...timeout }));
       else if (requiresUpdate) reject(Object.assign(new Error(`${clientUpdateMessage} Events remain pending.`), { code: 'CLIENT_UPDATE_REQUIRED', retryable: false, sessionId, requiresUpdate: true }));
       else if (code !== 0 || failed || !completed) reject(Object.assign(new Error(requiresAuthentication ? `${capability.client} requires sign-in before unattended work can continue. ${capability.client === 'claude-code' ? 'Open Claude Code and run /login' : 'Configure authentication in Gemini CLI'}, then rerun enrollment. Events remain pending.` : requiresApproval ? `${capability.client} requires approval for its configured tools before unattended work can continue. Resolve the denied permission in the client, then rerun enrollment. Events remain pending.` : `${capability.client} turn did not complete (${signal ?? code}${failed ? ', provider error' : ''}). Events remain pending.`), { sessionId, requiresApproval, requiresAuthentication, ...(usageRecoveryError ? { usageRecoveryError } : {}) }));
-      else resolve({ sessionId, completed, bytes });
+      else resolve({ sessionId, completed, bytes, ...(permissionDenials ? { permissionDenials } : {}) });
     };
     // Prefer close: ordinary EOF finalizes immediately. Exit is only a bounded
     // fallback when an inherited pipe prevents close from arriving.

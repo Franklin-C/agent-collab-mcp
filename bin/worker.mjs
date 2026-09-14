@@ -307,9 +307,10 @@ export async function work(options) {
         if (!result.stop) authority.accept(heartbeatStartedAt, result.leaseDurationMs);
         if (result.stop) {
           const taskBlocked = Boolean(taskId) && result.reason === 'Task blocked pending new information';
-          const normalTerminal = Boolean(taskId) && (taskBlocked || result.reason === 'Task completed');
+          const taskReleased = Boolean(taskId) && result.reason === 'Task released by this worker';
+          const normalTerminal = Boolean(taskId) && (taskBlocked || taskReleased || result.reason === 'Task completed');
           if (normalTerminal && (!failure || failure.normalTerminal)) {
-            failure = Object.assign(new Error(result.reason), { normalTerminal: true, taskBlocked });
+            failure = Object.assign(new Error(result.reason), { normalTerminal: true, taskBlocked, taskReleased });
             // The task can finish through MCP before its CLI emits final usage
             // and the local handoff. Grant an already-running client one fixed
             // grace period; no later heartbeat can extend it or override a stop.
@@ -362,7 +363,11 @@ export async function work(options) {
         authority.check();
         lock.setPhase('client_active');
         clientRunning = true; clientStarted = true;
-        try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, write: true, model: options.model, profile: options.profile, signal: controller.signal, timeoutMs: Math.min(job.maxMinutes, 120) * 60000,
+        try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, write: true, model: options.model, profile: options.profile,
+          // Claude Code headless turns need an explicit allow-list entry for
+          // the MCP namespace. The assigned worktree is already the process
+          // cwd, so no additional directory grant is needed here.
+          ...(capability.client === 'claude-code' ? { allowedTools: ['mcp__agent-collab__*'] } : {}), signal: controller.signal, timeoutMs: Math.min(job.maxMinutes, 120) * 60000,
           onActivity: observation,
           // Coordination reservations use the durable job id; attributing usage
           // to that same key lets the service consume the reserved allocation.

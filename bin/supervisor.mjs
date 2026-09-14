@@ -79,7 +79,7 @@ export async function supervise(options) {
           void flushUsage();
         },
         onSession: sessionId => { if (sessionId && state.sessionId !== sessionId) { state.sessionId = sessionId; persist(); } },
-      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log('Client turn completed.'); })
+      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log(`Client turn completed.${result.permissionDenials ? ` ${result.permissionDenials} denied permission request(s) were recovered in-turn.` : ''}`); })
         .catch(error => {
           if (error.sessionId) state.sessionId = error.sessionId;
           if (error.usageRecoveryError || error.code === 'CODEX_USAGE_UNAVAILABLE') {
@@ -92,9 +92,9 @@ export async function supervise(options) {
           }
           if (error.requiresApproval) {
             state.failures = 3;
-            state.pauseReason = 'mcp_approval_required';
+            state.pauseReason = 'client_permission_required';
             persist();
-            log('MCP approval required. Paused with events retained; resolve approval with the operator before restarting with --retry-failed. No approval settings were changed.');
+            log('Client permission approval required. Paused with events retained; resolve the denied permission with the operator before restarting with --retry-failed. No approval settings were changed.');
             return;
           }
           state.failures += 1; persist(); log(`${error.message} Attempt ${state.failures}/3; ${state.failures >= 3 ? 'paused until --retry-failed' : 'retry on next poll'}.`);

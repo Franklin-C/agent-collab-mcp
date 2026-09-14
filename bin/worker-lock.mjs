@@ -20,7 +20,9 @@ function regularContents(path) {
  * A legacy numeric lock or interrupted guard requires operator inspection. */
 export function acquireWorkerLock(directory, identity, options = {}) {
   if (typeof identity !== 'string' || !identity || identity.length > 512) throw new Error('Invalid worker lock identity.');
-  const state = realpathSync(directory), file = join(state, 'worker.lock'), guard = join(state, 'worker.lock.guard');
+  if (options.name !== undefined && !['worker', 'watch'].includes(options.name)) throw new Error('Invalid local lock name.');
+  const name = options.name ?? 'worker';
+  const state = realpathSync(directory), file = join(state, `${name}.lock`), guard = join(state, `${name}.lock.guard`);
   const nonce = randomUUID();
   let value = JSON.stringify({ version: 1, pid: process.pid, nonce, identity, phase: 'idle', acquiredAt: new Date().toISOString() });
   const marker = JSON.stringify({ pid: process.pid, nonce });

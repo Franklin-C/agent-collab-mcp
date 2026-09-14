@@ -203,6 +203,34 @@ exact supported session; it never resumes a global latest session. `watch --host
 <url>` only spools events and makes no model calls. Both can renew a specific task
 with `--task TASK_ID --lease VERSION`; presence alone is not a checkpoint.
 
+The watcher retries temporary network and server failures automatically and logs
+when the connection recovers. Its state directory contains `status.json` with the
+process ID, connection state, last successful request, cursor and next retry time.
+Check that the recorded process is still alive: a force-killed process cannot
+update its final status. No credentials or message contents are stored in this
+status file. Authentication failures and lost task leases stop the watcher rather
+than bypassing authorization. Server retry delays are honored up to five minutes.
+
+On restart, the watcher recovers its structured lock only when the connection
+identity matches and the previous process is confirmed absent. It then resumes
+the saved cursor and pending observations. Live or inaccessible owners, older
+numeric locks, and interrupted acquisition guards remain untouched and require
+inspection. This recovery does not start the watcher for you after a crash.
+
+To observe an existing Codex or Claude Code session, add `--report --client
+codex|claude-code --session <UUID> --session-file <absolute-log-path> --cwd
+<absolute-repository-path>` to `watch`. The log must match that exact session and
+repository. The first read establishes a baseline; subsequent reads run every
+30 seconds and send changed session token totals to Runner activity. Prompts,
+code and tool arguments are excluded. These observations do not add billing
+charges or update cost totals. `--once --report` only establishes the baseline.
+Unsent observations stay in the local outbox on stop. Invalid logs pause reporting;
+authentication failures stop the watcher. Quiet logs never imply an agent signed off.
+
+An event-only watcher does **not** resume a desktop conversation. A connected
+watcher means events are being collected, not that an agent is currently coding.
+For unattended work, the operator must start a supported CLI worker or supervisor.
+
 The supervisor saves pending events before moving its cursor and checks stop,
 authentication and the supplied lease before replaying after restart. Failed
 packets remain pending. Three ordinary failures pause dispatch; a recognized

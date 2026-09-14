@@ -35,45 +35,71 @@ export function createActivityReporter(options) {
   if (state.pending.some((item, index) => !Number.isSafeInteger(item.sequence) || item.sequence < 1 || item.sequence >= state.nextSequence || (index > 0 && item.sequence <= state.pending[index - 1].sequence) || !safeId(item.runId) || !Number.isFinite(Date.parse(item.occurredAt)) || !safeActivity(item) || (item.taskId !== undefined && !safeId(item.taskId)))) throw new Error('Activity outbox is invalid; retain it for inspection.');
   // Re-sanitize disk content too: never upload an unexpected property added to an outbox.
   state.pending = state.pending.map(item => ({ ...safeActivity(item), runId: item.runId, sequence: item.sequence, occurredAt: item.occurredAt, ...(item.taskId ? { taskId: item.taskId } : {}) }));
-  const persist = () => {
+  const persist = (next = state) => {
     mkdirSync(dirname(options.statePath), { recursive: true, mode: 0o700 });
     const temp = `${options.statePath}.tmp`;
-    writeFileSync(temp, JSON.stringify(state), { mode: 0o600 }); renameSync(temp, options.statePath);
+    writeFileSync(temp, JSON.stringify(next), { mode: 0o600 }); renameSync(temp, options.statePath);
+    // Publish in memory only after the durable replacement succeeds. A failed
+    // write must neither enqueue an unaccepted event nor forget a pending one.
+    state = next;
   };
   persist();
-  let inflight = null, closed = false, failures = 0, retryAt = 0;
+  let inflight = null, closed = false, failures = 0, retryAt = 0, permanentError = null, interval = null;
+  const cancellation = new AbortController();
+  const stop = () => {
+    closed = true;
+    clearInterval(interval);
+    cancellation.abort();
+    options.signal?.removeEventListener('abort', stop);
+  };
+  options.signal?.addEventListener('abort', stop, { once: true });
+  if (options.signal?.aborted) stop();
   const reportFailure = error => options.onError?.(error);
   const flush = () => {
     if (inflight) return inflight;
+    if (cancellation.signal.aborted) return Promise.resolve();
+    if (permanentError) return Promise.reject(permanentError);
     inflight = (async () => {
       // A bounded flush never monopolizes the runner when a long offline backlog returns.
       for (let batch = 0; batch < 4 && state.pending.length; batch++) {
         const events = state.pending.slice(0, 50);
-        const response = await (options.fetch ?? fetch)(`${server.origin}/api/agent/activity`, { method: 'POST', headers: { Authorization: `Bearer ${options.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ runtimeId: state.runtimeId, events }), signal: AbortSignal.timeout(10000), redirect: 'error' });
-        if (!response.ok) throw new Error(`Activity delivery failed (${response.status}); pending events retained.`);
+        cancellation.signal.throwIfAborted();
+        const response = await (options.fetch ?? fetch)(`${server.origin}/api/agent/activity`, { method: 'POST', headers: { Authorization: `Bearer ${options.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ runtimeId: state.runtimeId, events }), signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(10000)]), redirect: 'error' });
+        if (!response.ok) throw Object.assign(new Error(`Activity delivery failed (${response.status}); pending events retained.`), { status: response.status, permanent: [400, 401, 403, 404, 409, 422].includes(response.status) });
         const acknowledgement = await response.json();
+        cancellation.signal.throwIfAborted();
         if (!Number.isSafeInteger(acknowledgement.acceptedThrough) || acknowledgement.acceptedThrough < events.at(-1).sequence || acknowledgement.acceptedThrough >= state.nextSequence) throw new Error('Invalid activity acknowledgement; pending events retained.');
-        state.pending = state.pending.filter(event => event.sequence > acknowledgement.acceptedThrough); persist();
+        persist({ ...state, pending: state.pending.filter(event => event.sequence > acknowledgement.acceptedThrough) });
       }
       failures = 0; retryAt = 0;
-    })().catch(error => { failures++; retryAt = now() + Math.min(300000, 5000 * 2 ** Math.min(failures, 6)); throw error; }).finally(() => { inflight = null; });
+    })().catch(error => {
+      if (cancellation.signal.aborted) return;
+      if (error.permanent) { permanentError = error; clearInterval(interval); }
+      failures++; retryAt = now() + Math.min(300000, 5000 * 2 ** Math.min(failures, 6)); throw error;
+    }).finally(() => { inflight = null; });
     return inflight;
   };
-  const tick = () => { if (now() >= retryAt) void flush().catch(reportFailure); };
-  const interval = setInterval(tick, Math.max(1000, options.flushIntervalMs ?? 5000)); interval.unref();
+  const tick = () => { if (!closed && !permanentError && now() >= retryAt) void flush().catch(reportFailure); };
+  if (!closed) { interval = setInterval(tick, Math.max(1000, options.flushIntervalMs ?? 5000)); interval.unref(); }
   return {
     runtimeId: state.runtimeId,
     record(raw, context) {
-      if (closed) return false;
+      if (closed || permanentError) return false;
       const event = safeActivity(raw);
       if (!event || !safeId(context?.runId) || (context.taskId !== undefined && !safeId(context.taskId))) return false;
       if (state.pending.length >= maxPending) { reportFailure(new Error('Activity outbox is full; additional observations are paused until delivery recovers.')); return false; }
-      state.pending.push({ ...event, runId: context.runId, sequence: state.nextSequence++, occurredAt: new Date(now()).toISOString(), ...(context.taskId ? { taskId: context.taskId } : {}) }); persist();
+      persist({ ...state, nextSequence: state.nextSequence + 1, pending: [...state.pending, { ...event, runId: context.runId, sequence: state.nextSequence, occurredAt: new Date(now()).toISOString(), ...(context.taskId ? { taskId: context.taskId } : {}) }] });
       if (['needs_permission', 'needs_authentication', 'run_failed', 'run_stopped'].includes(event.kind)) tick();
       return true;
     },
     flush,
-    async close() { closed = true; clearInterval(interval); await flush(); },
+    // Stop cancels transport and retains the outbox. Normal close still drains
+    // final observations; an operator abort must never start a final upload.
+    stop,
+    async close() {
+      closed = true; clearInterval(interval);
+      try { await flush(); } finally { options.signal?.removeEventListener('abort', stop); }
+    },
   };
 }
 
