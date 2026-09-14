@@ -278,6 +278,19 @@ test('fresh assignments direct agents to the current General and GitHub workflow
   assert.doesNotMatch(deliveredPrompt, /use Plan for decisions|Improve for suggestions|memory for reusable discoveries/);
 });
 
+test('worker usage retains observed native session metadata without changing billing keys', async t => {
+  const f = executableFixture(t), id = '01900000-0000-7000-8000-000000000001';
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    args.onSession(id);
+    return f.options.runClient(client, prompt, args);
+  } });
+  const reports = f.sent.filter(item => item.url.endsWith('/api/usage/report')).map(item => item.data);
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0].native_session, { client: 'codex', id });
+  assert.equal(reports[0].session_id, 'worker-coord-agent-1');
+  assert.equal(reports[0].event_id, 'worker-coord-agent-1-0');
+});
+
 test('the final usage drain is bounded and preserves undelivered reports after Stop', async t => {
   const f = executableFixture(t), stop = new AbortController(), sent = [], originalTimeout = globalThis.setTimeout;
   t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => originalTimeout(callback, ms === 5000 ? 50 : ms, ...args));

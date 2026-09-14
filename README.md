@@ -322,6 +322,14 @@ report does not charge interim tokens again. A successful fresh run can still
 use final stdout when no checkpoint becomes available. Other adapters report
 the structured usage their clients emit, often at turn completion.
 
+Worker and supervisor reports also retain `native_session: {client, id}` when
+Codex or Claude supplies a native session UUID. This correlation metadata does
+not replace the existing billing session or event ID, reset cumulative counters,
+or grant accounting ownership. Fresh invocations never inherit an earlier
+session's identity when the current client has not reported one. Older servers
+ignore this optional metadata; native watch billing remains disabled until the
+shared accounting contract is implemented.
+
 Readers check the exact session and workspace, file identity, append-only
 content, counter consistency and deadlines. Explicit native resume subtracts a
 pre-launch baseline and pauses on ambiguous accounting. The worker interleaves

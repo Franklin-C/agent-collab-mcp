@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { assertEnrollmentBinding, inspectClient, runClient } from './client-adapters.mjs';
 import { createUsageCollector } from './usage.mjs';
+import { nativeUsageSession } from './native-usage-session.mjs';
 import { createActivityReporter } from './activity.mjs';
 import { acquireWorkerLock } from './worker-lock.mjs';
 import { compactHousekeeping, housekeepWorker, rememberHousekeeping } from './housekeeping.mjs';
@@ -363,17 +364,20 @@ export async function work(options) {
         authority.check();
         lock.setPhase('client_active');
         clientRunning = true; clientStarted = true;
+        let observedSessionId = null;
         try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, write: true, model: options.model, profile: options.profile,
           // Claude Code headless turns need an explicit allow-list entry for
           // the MCP namespace. The assigned worktree is already the process
           // cwd, so no additional directory grant is needed here.
           ...(capability.client === 'claude-code' ? { allowedTools: ['mcp__agent-collab__*'] } : {}), signal: controller.signal, timeoutMs: Math.min(job.maxMinutes, 120) * 60000,
           onActivity: observation,
+          onSession: sessionId => { if (sessionId) observedSessionId = sessionId; },
           // Coordination reservations use the durable job id; attributing usage
           // to that same key lets the service consume the reserved allocation.
           onUsage: raw => {
             const batch = collectUsage(raw);
-            for (const report of batch) { state.usage.push({ ...report, source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); }
+            const nativeSession = nativeUsageSession(capability.client, raw, observedSessionId);
+            for (const report of batch) { state.usage.push({ ...report, ...(nativeSession ? { native_session: nativeSession } : {}), source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); }
             // Deliver passive counts, then evaluate the budget promptly on the
             // same serialized heartbeat chain used for lease renewal and Stop.
             if (batch.length) queuePulse();
