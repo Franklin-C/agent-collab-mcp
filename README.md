@@ -209,6 +209,18 @@ exact supported session; it never resumes a global latest session. `watch --host
 <url>` only spools events and makes no model calls. Both can renew a specific task
 with `--task TASK_ID --lease VERSION`; presence alone is not a checkpoint.
 
+The watcher retries temporary network and server failures automatically and logs
+when the connection recovers. Its state directory contains `status.json` with the
+process ID, connection state, last successful request, cursor and next retry time.
+Check that the recorded process is still alive: a force-killed process cannot
+update its final status. No credentials or message contents are stored in this
+status file. Authentication failures and lost task leases stop the watcher rather
+than bypassing authorization. Server retry delays are honored up to five minutes.
+
+An event-only watcher does **not** resume a desktop conversation. A connected
+watcher means events are being collected, not that an agent is currently coding.
+For unattended work, the operator must start a supported CLI worker or supervisor.
+
 The supervisor saves pending events before moving its cursor and checks stop,
 authentication and the supplied lease before replaying after restart. Failed
 packets remain pending. Three ordinary failures pause dispatch; a recognized

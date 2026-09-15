@@ -53,7 +53,9 @@ export function createActivityReporter(options) {
         if (!response.ok) throw new Error(`Activity delivery failed (${response.status}); pending events retained.`);
         const acknowledgement = await response.json();
         if (!Number.isSafeInteger(acknowledgement.acceptedThrough) || acknowledgement.acceptedThrough < events.at(-1).sequence || acknowledgement.acceptedThrough >= state.nextSequence) throw new Error('Invalid activity acknowledgement; pending events retained.');
-        state.pending = state.pending.filter(event => event.sequence > acknowledgement.acceptedThrough); persist();
+        // New events can arrive while this request is in flight. The server's
+        // high-water mark does not prove those unsent events were delivered.
+        state.pending = state.pending.filter(event => event.sequence > events.at(-1).sequence); persist();
       }
       failures = 0; retryAt = 0;
     })().catch(error => { failures++; retryAt = now() + Math.min(300000, 5000 * 2 ** Math.min(failures, 6)); throw error; }).finally(() => { inflight = null; });

@@ -5,11 +5,13 @@ import { createUsageCollector } from './usage.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { inspectClient, runClient } from './client-adapters.mjs';
 import { createActivityReporter } from './activity.mjs';
+import { createConnectorDiagnostics } from './connector-version.mjs';
 
 const delay = (ms, signal) => new Promise(resolve => { const timer = setTimeout(done, ms); function done() { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); } signal.addEventListener('abort', done, { once: true }); if (signal.aborted) done(); });
 
 /** The poller renews presence independently of the single, bounded client worker. */
 export async function supervise(options) {
+  const diagnostics = createConnectorDiagnostics();
   const token = options.token ?? process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error('Set AGENT_COLLAB_TOKEN before supervising.');
   const cwd = realpathSync(options.cwd ?? process.cwd());
@@ -79,7 +81,7 @@ export async function supervise(options) {
           void flushUsage();
         },
         onSession: sessionId => { if (sessionId && state.sessionId !== sessionId) { state.sessionId = sessionId; persist(); } },
-      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log('Client turn completed.'); })
+      }).then(result => { state.sessionId = result.sessionId ?? state.sessionId; state.pending.splice(0, batch.length); state.failures = 0; persist(); log(`Client turn completed.${result.permissionDenials ? ` ${result.permissionDenials} denied permission request(s) were recovered in-turn.` : ''}`); })
         .catch(error => {
           if (error.sessionId) state.sessionId = error.sessionId;
           if (error.usageRecoveryError || error.code === 'CODEX_USAGE_UNAVAILABLE') {
@@ -92,9 +94,9 @@ export async function supervise(options) {
           }
           if (error.requiresApproval) {
             state.failures = 3;
-            state.pauseReason = 'mcp_approval_required';
+            state.pauseReason = 'client_permission_required';
             persist();
-            log('MCP approval required. Paused with events retained; resolve approval with the operator before restarting with --retry-failed. No approval settings were changed.');
+            log('Client permission approval required. Paused with events retained; resolve the denied permission with the operator before restarting with --retry-failed. No approval settings were changed.');
             return;
           }
           state.failures += 1; persist(); log(`${error.message} Attempt ${state.failures}/3; ${state.failures >= 3 ? 'paused until --retry-failed' : 'retry on next poll'}.`);
@@ -113,10 +115,11 @@ export async function supervise(options) {
       // persisted work, including the first batch after a process restart.
       await flushUsage();
       try {
-        const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/watch`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(55000)]), body: JSON.stringify({ since_seq: state.cursor, ...(options.task ? { task_id: options.task, lease_version: Number(options.lease) } : {}) }) });
+        const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/watch`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(55000)]), body: JSON.stringify({ since_seq: state.cursor, connector: diagnostics.report(), ...(options.task ? { task_id: options.task, lease_version: Number(options.lease) } : {}) }) });
         if ([400, 401, 403, 404, 409].includes(response.status)) throw Object.assign(new Error(`Watch returned ${response.status}; reconnect or resolve the lease before restarting.`), { fatal: true });
         if (!response.ok) throw new Error(`Watch returned ${response.status}.`);
         const data = await response.json();
+        state.connector = diagnostics.observe(data.connector); persist();
         if (data.stop_requested) { stop(); break; }
         if (!Number.isSafeInteger(data.next_seq) || data.next_seq < state.cursor || !Array.isArray(data.events)) throw new Error('Invalid watch response.');
         if (state.pending.length + data.events.length > 2000) throw Object.assign(new Error('Pending event limit reached; resolve the paused client before restarting. Cursor retained.'), { fatal: true });

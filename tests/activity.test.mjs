@@ -8,6 +8,27 @@ import { createActivityReporter, safeActivity, clientActivity, clientUsageActivi
 import { capabilityContract, invocation, readClientDiagnostic, readClientEvent, resolveClientExecutable, runClient } from '../bin/client-adapters.mjs';
 
 const response = acceptedThrough => new Response(JSON.stringify({ acceptedThrough }));
+
+test('an advanced acknowledgement does not discard events added during the request', async t => {
+  let release;
+  const packets = [];
+  const options = setup(t, { fetch: async (_url, request) => {
+    packets.push(JSON.parse(request.body));
+    if (packets.length === 1) await new Promise(resolve => { release = resolve; });
+    return response(2);
+  } });
+  const reporter = createActivityReporter(options);
+  try {
+    reporter.record({ kind: 'run_started' }, { runId: 'one' });
+    const pending = reporter.flush();
+    reporter.record({ kind: 'tool_started', tool: 'command' }, { runId: 'one' });
+    release();
+    await pending;
+    assert.deepEqual(packets.map(packet => packet.events.map(event => event.sequence)), [[1], [2]]);
+    assert.equal(JSON.parse(readFileSync(options.statePath)).pending.length, 0);
+  } finally { await reporter.close(); }
+});
+
 function setup(t, extra = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ehgi-activity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

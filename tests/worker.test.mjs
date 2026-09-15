@@ -123,6 +123,18 @@ function executableFixture(t, finishSucceeds = true) {
   return { ...f, sent, options, cwd: join(f.state, 'worktrees', 'coord-agent-1'), archive: join(f.state, 'handoffs', 'worker-coord-agent-1.json') };
 }
 
+test('Claude managed workers admit the MCP namespace for the assigned worktree', async t => {
+  const f = executableFixture(t);
+  let invocation;
+  await work({ ...f.options, model: undefined, capability: { client: 'claude-code', version: 'fixture', compatible: true }, runClient: async (_client, _prompt, args) => {
+    invocation = args;
+    args.onUsage({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 3 } });
+    writeFileSync(join(args.cwd, '.ehgi-handoff.json'), JSON.stringify(handoff));
+    return { completed: true };
+  } });
+  assert.deepEqual(invocation.allowedTools, ['mcp__agent-collab__*']);
+});
+
 test('coordination usage identifies its job reservation and acknowledged handoffs are archived before cleanup', async t => {
   const f = executableFixture(t); await work(f.options);
   const usage = f.sent.filter(item => item.url.endsWith('/api/usage/report'));
@@ -249,6 +261,21 @@ test('final provider usage is delivered after Stop without starting another paid
   const reports = f.sent.filter(item => item.url.endsWith('/api/usage/report'));
   assert.equal(reports.length, 1); assert.equal(reports[0].data.input_tokens, 13);
   assert.deepEqual(JSON.parse(readFileSync(join(f.state, 'state.json'), 'utf8')).usage, []);
+});
+
+test('fresh assignments direct agents to the current General and GitHub workflow', async t => {
+  const f = executableFixture(t);
+  let deliveredPrompt;
+  await work({ ...f.options, runClient: async (client, prompt, args) => {
+    deliveredPrompt = prompt;
+    return f.options.runClient(client, prompt, args);
+  } });
+  assert.match(deliveredPrompt, /Use General for task questions, decisions and suggestions/);
+  assert.match(deliveredPrompt, /Call get_briefing first with have_repo_playbook: true after reading AGENTS\.md, then get_inbox/);
+  assert.match(deliveredPrompt, /assignment task association/);
+  assert.match(deliveredPrompt, /channel and thread IDs returned by the hub/);
+  assert.match(deliveredPrompt, /GitHub Projects for task planning, GitHub issues for verified bugs/);
+  assert.doesNotMatch(deliveredPrompt, /use Plan for decisions|Improve for suggestions|memory for reusable discoveries/);
 });
 
 test('the final usage drain is bounded and preserves undelivered reports after Stop', async t => {
@@ -499,7 +526,7 @@ test('a continuing usage producer cannot postpone authority Stop until the outbo
 });
 
 function finalizingChildFixture(t, { reason = 'Task completed', expire = false, restrictive } = {}) {
-  const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : 'blocked' };
+  const f = executableFixture(t), output = { ...handoff, outcome: reason === 'Task completed' ? 'complete' : reason === 'Task released by this worker' ? 'more_work' : 'blocked' };
   const executable = join(f.root, 'finalizing-child.cjs');
   writeFileSync(executable, `const {writeFileSync}=require('node:fs');
     console.log(JSON.stringify({type:'thread.started',thread_id:'01a08354-4c9d-7c90-becb-39b58bc8ca35'}));
@@ -538,7 +565,7 @@ function finalizingChildFixture(t, { reason = 'Task completed', expire = false, 
   return { ...f, options, output, observed: () => ({ terminalPulses, graceTimers, cancelled }) };
 }
 
-for (const reason of ['Task completed', 'Task blocked pending new information']) test(`a real child can emit its final handoff and usage after ${reason}`, async t => {
+for (const reason of ['Task completed', 'Task blocked pending new information', 'Task released by this worker']) test(`a real child can emit its final handoff and usage after ${reason}`, async t => {
   const f = finalizingChildFixture(t, { reason }); await work(f.options);
   assert.deepEqual(f.sent.find(item => item.data.action === 'finish')?.data.handoff, f.output);
   assert.ok(f.observed().terminalPulses >= 1); assert.equal(f.observed().graceTimers, 1);
