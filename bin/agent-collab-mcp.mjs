@@ -56,7 +56,7 @@ function usage(code = 0) {
   watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once]
   doctor --host <url> [--client <name>] [--report] check connection/config (reads AGENT_COLLAB_TOKEN;
            --report tells the hub how far this machine got, for the Connect panel)
-  update-check                  check this owned package for a newer release
+  update-check                  check GitHub for a newer connector release
   serve --host <url>            stdio bridge (reads AGENT_COLLAB_TOKEN)
   env <token>                   print how to set AGENT_COLLAB_TOKEN on this OS
 `);

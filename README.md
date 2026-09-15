@@ -303,15 +303,21 @@ merge, recovery and Stop checks across authorized clients.
 `update-check` reads the public repository's latest stable GitHub release and
 checks its tag and repository URLs. It never installs anything or upgrades an
 active worker. No published release returns `unreleased`; a rate limit or failed
-request returns `unavailable`, preserving the previous cache.
+request returns `unavailable`, preserving the previous confirmed cache. Missing
+releases and rate limits use a short backoff, respecting Retry-After up to one day.
 
 To release, a maintainer first creates and pushes `vVERSION` at the reviewed
 standalone main commit whose package.json contains VERSION. Manually dispatch
 `connector-release.yml` on that same main commit with VERSION. The workflow checks
 the existing tag against the clean checkout, runs tests and syntax checks, packs
-the connector, and creates a GitHub release with the archive and its SHA-256 file.
-It downloads the archive again and compares it byte for byte. Existing releases
-are never overwritten. The `connector-release` environment can require maintainer
-approval. There is no automatic tag trigger and no npm publishing credential.
+the connector, and creates a draft GitHub release with the archive and its SHA-256
+file. It downloads the archive again, compares it byte for byte, and rechecks the
+tag before publishing. A failed verification leaves a draft. Existing releases
+are never overwritten. Configure required reviewers on the `connector-release`
+environment before the first dispatch. There is no automatic tag trigger or npm
+publishing credential; `private: true` prevents accidental npm publication.
+The `.tgz` asset is an installable package (`npm install -g ./downloaded-file.tgz`),
+not the full development checkout. Use the matching GitHub tag checkout with
+`npm ci` to run tests or develop the connector.
 `node scripts/prepare-release.mjs VERSION` verifies source/tag identity without
 publishing. Source export and passing local tests are not a published release.

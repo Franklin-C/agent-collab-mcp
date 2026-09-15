@@ -29,7 +29,8 @@ after(() => {
 });
 const { checkUpdate } = await import('../bin/update-check.mjs');
 const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-assert.equal(manifest.private, false);
+assert.equal(manifest.private, true);
+assert.equal(manifest.publishConfig, undefined);
 const repository = 'https://github.com/Franklin-C/agent-collab-mcp';
 const api = 'https://api.github.com/repos/Franklin-C/agent-collab-mcp/releases';
 const release = (version = '9.9.9') => ({ id: 12, tag_name: `v${version}`, draft: false, prerelease: false,
@@ -126,6 +127,45 @@ test('no GitHub release is a supported source-only installation, not an npm erro
   const f = fixture(t, '{}');
   assert.deepEqual(await checkUpdate({ fetcher: async () => new Response('', { status: 404 }), log: f.log }), { status: 'unreleased', current: manifest.version });
   assert.deepEqual(f.logs, []);
+});
+
+for (const status of [403, 404, 429]) test(`backs off repeated ${status} responses and allows explicit recovery`, async t => {
+  const f = fixture(t, '{}');
+  let calls = 0;
+  const fetcher = async () => { calls++; return new Response('', { status, headers: { 'Retry-After': '1800' } }); };
+  const first = await checkUpdate({ fetcher, log: f.log });
+  assert.deepEqual(await checkUpdate({ fetcher, log: f.log }), first);
+  assert.equal(calls, 1);
+  const backoff = join(dirname(f.cache), 'update-check-backoff.json');
+  const saved = JSON.parse(readFileSync(backoff, 'utf8'));
+  assert.equal(saved.delay, 1800000);
+  writeFileSync(backoff, JSON.stringify({ ...saved, at: Date.now() - saved.delay - 1 }));
+  await checkUpdate({ fetcher, log: f.log }); assert.equal(calls, 2);
+  assert.equal((await checkUpdate({ force: true, fetcher: f.fetcher, log: f.log })).status, 'update');
+  assert.equal((await checkUpdate({ fetcher, log: f.log })).status, 'cached');
+  assert.equal(calls, 2);
+});
+
+test('bounds Retry-After dates and malformed values', async t => {
+  const f = fixture(t, '{}');
+  for (const [retry, minimum, maximum] of [
+    [new Date(Date.now() + 3600000).toUTCString(), 3500000, 3600000],
+    ['999999999', 86400000, 86400000], ['invalid', 300000, 300000], ['-1', 300000, 300000],
+  ]) {
+    await checkUpdate({ force: true, fetcher: async () => new Response('', { status: 429, headers: { 'Retry-After': retry } }), log: f.log });
+    const { delay } = JSON.parse(readFileSync(join(dirname(f.cache), 'update-check-backoff.json'), 'utf8'));
+    assert.ok(delay >= minimum && delay <= maximum);
+  }
+});
+
+for (const [label, fetcher] of [
+  ['timeout', async () => { throw new DOMException('Timed out', 'TimeoutError'); }],
+  ['non-JSON', async () => new Response('<html>unavailable</html>')],
+  ['foreign owner', async () => Response.json({ ...release(), url: 'https://api.github.com/repos/other/agent-collab-mcp/releases/12' })],
+]) test(`fails quietly for ${label} without overwriting confirmed cache`, async t => {
+  const body = JSON.stringify(cached(Date.now() - 2 * 86400000)), f = fixture(t, body);
+  assert.equal((await checkUpdate({ fetcher, log: f.log })).status, 'unavailable');
+  assert.equal(readFileSync(f.cache, 'utf8'), body); assert.deepEqual(f.logs, []);
 });
 
 for (const version of [manifest.version, '0.0.0']) test(`does not suggest a reinstall for ${version}`, async t => {

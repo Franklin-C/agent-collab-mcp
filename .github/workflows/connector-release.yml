@@ -22,6 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -48,8 +49,9 @@ jobs:
           TAG="v$EXPECTED_VERSION"
           test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-          gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --verify-tag --title "$TAG" --generate-notes
+          gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --draft --verify-tag --title "$TAG" --generate-notes
           gh release download "$TAG" --pattern "$ARCHIVE" --dir "$RUNNER_TEMP/connector-release-check"
           cmp "$ARCHIVE" "$RUNNER_TEMP/connector-release-check/$ARCHIVE"
           test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          gh release edit "$TAG" --draft=false
           gh release view "$TAG" --json url,tagName,isDraft,isPrerelease
