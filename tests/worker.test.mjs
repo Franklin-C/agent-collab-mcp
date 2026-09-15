@@ -505,11 +505,15 @@ function finalizingChildFixture(t, { reason = 'Task completed', expire = false, 
     console.log(JSON.stringify({type:'thread.started',thread_id:'01a08354-4c9d-7c90-becb-39b58bc8ca35'}));
     ${expire || restrictive ? 'setInterval(()=>{},1000);' : `setTimeout(()=>{writeFileSync('.ehgi-handoff.json',${JSON.stringify(JSON.stringify(output))});console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:3}}));},700);`}`);
   const originalInterval = globalThis.setInterval, originalTimeout = globalThis.setTimeout;
-  let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false;
-  // Compress only worker heartbeat/grace timers; the child is a real Node
+  let started = false, terminalPulses = 0, graceTimers = 0, cancelled = false, expireGrace;
+  // Compress worker heartbeats; explicitly expire grace after a repeated pulse.
+  // The child is a real Node
   // process with its own real clock, filesystem handoff and structured output.
   t.mock.method(globalThis, 'setInterval', (callback, ms, ...args) => originalInterval(callback, ms === 20000 ? 80 : ms, ...args));
-  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => { if (ms === 30000) graceTimers++; return originalTimeout(callback, expire && ms === 30000 ? 250 : ms, ...args); });
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+    if (ms === 30000) { graceTimers++; if (expire) expireGrace = () => callback(...args); }
+    return originalTimeout(callback, ms, ...args);
+  });
   const options = { ...f.options,
     fetch: async (url, request) => {
       const data = JSON.parse(request.body), result = await f.options.fetch(url, request);
@@ -519,6 +523,7 @@ function finalizingChildFixture(t, { reason = 'Task completed', expire = false, 
       }
       if (data.action === 'heartbeat' && started) {
         terminalPulses++;
+        if (expire && terminalPulses === 2) originalTimeout(() => expireGrace(), 0);
         if (restrictive && terminalPulses > 1) return typeof restrictive === 'number' ? new Response(JSON.stringify({ error: 'Execution authorization or fence changed' }), { status: restrictive }) : response({ stop: true, reason: restrictive });
         return response({ stop: true, reason, leaseVersion: reason === 'Task completed' ? 7 : 8 });
       }
@@ -541,7 +546,7 @@ for (const reason of ['Task completed', 'Task blocked pending new information'])
   assert.deepEqual(JSON.parse(readFileSync(f.archive, 'utf8')).handoff, f.output);
 });
 
-test('repeated terminal heartbeats cannot extend a real child finalization deadline', async t => {
+test('repeated terminal heartbeats cannot extend a real child finalization deadline', { timeout: 10000 }, async t => {
   const f = finalizingChildFixture(t, { expire: true }); await work(f.options);
   assert.ok(f.observed().terminalPulses >= 2); assert.equal(f.observed().graceTimers, 1); assert.equal(f.observed().cancelled, true);
   const finish = f.sent.find(item => item.data.action === 'finish')?.data;
