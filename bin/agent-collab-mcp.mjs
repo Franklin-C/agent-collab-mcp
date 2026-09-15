@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 
 import { checkUpdate } from "./update-check.mjs";
 import { supervise } from "./supervisor.mjs";
+import { createConnectorDiagnostics } from "./connector-version.mjs";
 
 const [command, ...rest] = process.argv.slice(2);
 const flags = {};
@@ -192,6 +193,7 @@ async function doctor() {
 }
 
 async function watch() {
+  const diagnostics = createConnectorDiagnostics();
   const base = host();
   const token = process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error("Set AGENT_COLLAB_TOKEN before running watch.");
@@ -201,10 +203,22 @@ async function watch() {
   const lock = join(directory, "watch.lock");
   try { writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 }); }
   catch { throw new Error(`Another watcher owns ${directory}. Stop it first; remove watch.lock only after confirming its recorded PID is no longer running.`); }
-  const release = () => { try { unlinkSync(lock); } catch {} };
+  const statusFile = join(directory, "status.json");
+  let connection = { state: "starting", pid: process.pid, mode: "events_only", automatic_client_resume: false };
+  const status = (update) => {
+    connection = { ...connection, ...update, updated_at: new Date().toISOString() };
+    safeWrite(statusFile, JSON.stringify(connection), false);
+  };
+  const release = () => {
+    try {
+      if (connection.state !== "stopped") status({ state: "stopped", reason: "process_exit", next_retry_at: null });
+    } catch { /* A full disk must not prevent lock release. */ }
+    try { unlinkSync(lock); } catch {}
+  };
   process.once("exit", release);
   process.once("SIGINT", () => process.exit(130));
   process.once("SIGTERM", () => process.exit(143));
+  status({ reason: null, next_retry_at: null });
   const cursorFile = join(directory, "cursor.json");
   let cursor = readJson(cursorFile).seq ?? Number(flags.since ?? 0);
   if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Invalid watch cursor.");
@@ -215,11 +229,20 @@ async function watch() {
       const response = await fetch(`${base}/api/agent/watch`, {
         method: "POST", signal: AbortSignal.timeout(55000),
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ since_seq: cursor, ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
+        body: JSON.stringify({ since_seq: cursor, passive: true, connector: diagnostics.report(), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
       });
-      if ([400, 401, 403, 404, 409].includes(response.status)) throw Object.assign(new Error(`Watch stopped (${response.status}); reconnect or reclaim the task before restarting.`), { fatal: true });
-      if (!response.ok) throw new Error(`Watch request failed (${response.status}).`);
+      if ([400, 401, 403, 404, 409].includes(response.status)) {
+        const reason = response.status === 401 || response.status === 403 ? "authentication_required" : response.status === 409 ? "lease_conflict" : "configuration_required";
+        throw Object.assign(new Error(`Watch stopped (${response.status}); reconnect or reclaim the task before restarting.`), { fatal: true, reason });
+      }
+      if (!response.ok) {
+        // Respect server back-pressure without accepting unbounded or invalid delays.
+        const retryAfter = response.headers.get("retry-after");
+        const retryMs = retryAfter === null ? 0 : /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now();
+        throw Object.assign(new Error(`Watch request failed (${response.status}).`), { retryMs: Number.isFinite(retryMs) ? Math.max(0, Math.min(300000, retryMs)) : 0 });
+      }
       const result = await response.json();
+      status({ connector: diagnostics.observe(result.connector) });
       if (!Number.isSafeInteger(result.next_seq) || result.next_seq < cursor || !Array.isArray(result.events)) throw new Error("Invalid watch response.");
       if (result.events.length) {
         // Durable spool precedes cursor advancement; replay can duplicate, never lose events.
@@ -228,13 +251,20 @@ async function watch() {
       }
       if (result.next_seq !== cursor) safeWrite(cursorFile, JSON.stringify({ seq: result.next_seq }), false);
       cursor = result.next_seq;
+      if (failures > 0) console.error("Watch reconnected; event monitoring resumed. This watcher does not automatically resume a desktop conversation.");
       failures = 0;
+      status({ state: result.stop_requested ? "stopped" : "connected", reason: result.stop_requested ? "stop_requested" : null, seq: cursor, failures, last_success_at: new Date().toISOString(), next_retry_at: null });
       if (result.stop_requested) return;
     } catch (error) {
-      if (error.fatal || flags.once === "true") throw error;
+      if (error.fatal || flags.once === "true") {
+        status({ state: "stopped", reason: error.reason ?? "request_failed", next_retry_at: null });
+        throw error;
+      }
       failures += 1;
       if (failures === 1) console.error("Watch disconnected; retrying without invoking an agent.");
-      await new Promise((resolve) => setTimeout(resolve, Math.min(60000, 1000 * 2 ** Math.min(failures, 6))));
+      const delay = Math.max(error.retryMs ?? 0, Math.min(60000, 1000 * 2 ** Math.min(failures, 6)));
+      status({ state: "retrying", reason: "connection_failed", failures, next_retry_at: new Date(Date.now() + delay).toISOString() });
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   } while (flags.once !== "true");
 }

@@ -65,7 +65,10 @@ export async function enroll(options) {
   try {
     const prompt = `This is an operator-authorized EhGI enrollment verification in a temporary Git worktree. Read AGENTS.md if present. Call get_briefing through the configured EhGI MCP server and obey stop_requested. Then call workforce_action with action "enrollment_verify" and input ${JSON.stringify({ workerId: state.workerId, challenge: challenge.challenge })}. Write exactly ${JSON.stringify(proof)} into ${proofName} using your file-edit tool, then read it back. Do not edit other files, claim tasks, open PRs, or change client permissions. Report any missing tools or approval requirement honestly and stop.`;
     lock.setPhase('client_active');
-    try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, profile: options.profile, model: options.model, write: true, timeoutMs: 180000, signal: options.signal, onActivity: event => activity.record(event, { runId }), onUsage: raw => {
+    try { await (options.runClient ?? runClient)(capability, prompt, { cwd, env: { ...(options.env ?? process.env), AGENT_COLLAB_TOKEN: token }, profile: options.profile, model: options.model, write: true, timeoutMs: 180000, signal: options.signal,
+      // Claude Code headless probes must be able to call the hub's MCP tools;
+      // keep this scope identical to the managed worker invocation.
+      ...(capability.client === 'claude-code' ? { allowedTools: ['mcp__agent-collab__*'] } : {}), onActivity: event => activity.record(event, { runId }), onUsage: raw => {
       for (const report of collectUsage(raw)) state.usage.push({ ...report, event_id: `${runId}-${reportIndex++}`, session_id: runId, phase: 'coordination', source: 'cli_stream' }); persist();
       void flushUsage().catch(() => {}); // Durable outbox retains failed deliveries.
     } }); } finally { lock.setPhase('idle'); }

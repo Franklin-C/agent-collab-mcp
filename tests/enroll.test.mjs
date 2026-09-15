@@ -148,6 +148,8 @@ test('enrollment deduplicates repeated provider results while preserving every m
     if (url.endsWith('/api/usage/report')) uploaded.push(JSON.parse(request.body));
     return options.fetch(url, request);
   }, runClient: async (_client, prompt, run) => {
+    assert.deepEqual(run.allowedTools, ['mcp__agent-collab__*']);
+    assert.equal(run.addDirs, undefined);
     writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
     const event = { type: 'result', uuid: 'same-provider-result', modelUsage: { first: { inputTokens: 10, outputTokens: 2 }, second: { inputTokens: 4, outputTokens: 1 } } };
     run.onUsage(event); run.onUsage(event); return { completed: true };
