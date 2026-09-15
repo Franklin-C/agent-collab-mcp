@@ -1,12 +1,12 @@
-# EhGI connector 0.3.1
+# EhGI connector
 
 Connect coding clients to EhGI, verify their execution permissions, and run fresh
-assignments through an operator-started companion. The owned npm package name is
-`@franklineh/agent-collab-mcp`. The unscoped `agent-collab-mcp` package belongs to
-another project; do not install it for this hub.
+assignments through an operator-started companion. GitHub is the supported
+distribution. The package name `@franklineh/agent-collab-mcp` identifies local npm
+tooling; it is not an npm registry installation path. The unscoped npm package
+belongs to another project; do not install it for this hub.
 
-A source version is not evidence that npm publication succeeded. Until the exact
-registry release is verified, install the reviewed source checkout:
+Install from the public source repository:
 
 ```sh
 git clone https://github.com/Franklin-C/agent-collab-mcp.git
@@ -14,6 +14,12 @@ cd agent-collab-mcp
 npm ci
 npm install -g .
 ```
+
+For a tagged release, review its notes on
+[GitHub Releases](https://github.com/Franklin-C/agent-collab-mcp/releases), then
+check out that exact tag before running the two npm commands. A source checkout
+also works before the first GitHub release is published. npm installs the source
+and its dependencies; no npm login or connector registry publication is required.
 
 ## Connection and enrollment
 
@@ -107,7 +113,7 @@ version 1; configuration support does not imply unattended execution support.
 
 ## Assignment workers
 
-The host enables **Automatic assignments** in **Workforce → Workers**, with
+The host enables **Automatic assignments** in **Settings → Workforce → Workers**, with
 per-run time, reported-cost and attempt limits. Otherwise the worker can consume
 explicitly queued managed jobs without scheduling automatic work.
 
@@ -292,16 +298,20 @@ explicit-resume acceptance remain to be tested. At the last provider probe,
 Claude Code 2.1.139 was logged out and Gemini CLI 0.58.0 had no configured
 authentication method.
 Rollout still needs actual enrollment, concurrent tasks, questions, reviews,
-merge, recovery and Stop checks across authorized clients. The owned npm package
-returned 404 at the last release check; public source/export alone is not a
-successful registry publication.
+merge, recovery and Stop checks across authorized clients.
 
-`update-check` checks the exact owned npm package/repository identity and never
-upgrades an active worker. The public repository's manually dispatched
-`connector-release.yml` workflow requires an exact committed version, tests the
-package, publishes with provenance and verifies the registry artifact. Normal
-releases use configured npm OIDC trusted publishing. First publication may
-require the owner's explicit bootstrap setup; a source export or passing test
-is not a completed publication. Keep all release credentials out of source and
-chat. [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/),
-[provenance](https://docs.npmjs.com/generating-provenance-statements/).
+`update-check` reads the public repository's latest stable GitHub release and
+checks its tag and repository URLs. It never installs anything or upgrades an
+active worker. No published release returns `unreleased`; a rate limit or failed
+request returns `unavailable`, preserving the previous cache.
+
+To release, a maintainer first creates and pushes `vVERSION` at the reviewed
+standalone main commit whose package.json contains VERSION. Manually dispatch
+`connector-release.yml` on that same main commit with VERSION. The workflow checks
+the existing tag against the clean checkout, runs tests and syntax checks, packs
+the connector, and creates a GitHub release with the archive and its SHA-256 file.
+It downloads the archive again and compares it byte for byte. Existing releases
+are never overwritten. The `connector-release` environment can require maintainer
+approval. There is no automatic tag trigger and no npm publishing credential.
+`node scripts/prepare-release.mjs VERSION` verifies source/tag identity without
+publishing. Source export and passing local tests are not a published release.
