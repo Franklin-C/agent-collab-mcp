@@ -5,6 +5,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createSessionObservationParser } from './session-observation.mjs';
 import { createNativeTurnState } from './native-turn-state.mjs';
 import { createNativeWorkspaceMetadata } from './native-workspace-metadata.mjs';
+import { createNativeAllowance } from './subscription-allowance.mjs';
 
 const failure = () => new Error('The exact session log cannot be safely observed.');
 const canonical = path => process.platform === 'win32' ? path.toLowerCase() : path;
@@ -17,6 +18,8 @@ export function createSessionFileObserver(path, options) {
   const absolute = resolve(path), parser = createSessionObservationParser(options.client, options), decoder = new StringDecoder('utf8');
   const turns = createNativeTurnState(options.client, options.sessionId);
   const workspace = createNativeWorkspaceMetadata(options.client, options);
+  const allowance = createNativeAllowance(options.client);
+  let committedAllowance = null;
   let committedWorkspace = null;
   let committedTurn = null;
   let identity = null, offset = 0, pending = '', committed = false, reading = null, fault = null;
@@ -45,7 +48,7 @@ export function createSessionFileObserver(path, options) {
             if (line.trim()) {
               const record = JSON.parse(line);
               parser.observe(record);
-              if (parser.isVerified()) { turns.observe(record); workspace.observe(record); }
+              if (parser.isVerified()) { turns.observe(record); workspace.observe(record); allowance.observe(record); }
               committed = true;
             }
           }
@@ -59,6 +62,7 @@ export function createSessionFileObserver(path, options) {
     const snapshot = committed ? parser.snapshot() : null;
     committedTurn = turns.snapshot();
     committedWorkspace = workspace.snapshot();
+    committedAllowance = allowance.snapshot();
     return snapshot;
   }
   const observe = () => {
@@ -70,6 +74,8 @@ export function createSessionFileObserver(path, options) {
     return reading;
   };
   observe.turnState = () => committedTurn;
+  observe.isVerified = () => parser.isVerified();
+  observe.allowanceSnapshot = () => committedAllowance;
   observe.workspaceMetadata = () => committedWorkspace && { ...committedWorkspace, files: [...committedWorkspace.files] };
   return observe;
 }

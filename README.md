@@ -1,12 +1,12 @@
-# EhGI connector 0.3.1
+# EhGI connector
 
 Connect coding clients to EhGI, verify their execution permissions, and run fresh
-assignments through an operator-started companion. The owned npm package name is
-`@franklineh/agent-collab-mcp`. The unscoped `agent-collab-mcp` package belongs to
-another project; do not install it for this hub.
+assignments through an operator-started companion. GitHub is the supported
+distribution. The package name `@franklineh/agent-collab-mcp` identifies local npm
+tooling; it is not an npm registry installation path. The unscoped npm package
+belongs to another project; do not install it for this hub.
 
-A source version is not evidence that npm publication succeeded. Until the exact
-registry release is verified, install the reviewed source checkout:
+Install from the public source repository:
 
 ```sh
 git clone https://github.com/Franklin-C/agent-collab-mcp.git
@@ -14,6 +14,12 @@ cd agent-collab-mcp
 npm ci
 npm install -g .
 ```
+
+For a tagged release, review its notes on
+[GitHub Releases](https://github.com/Franklin-C/agent-collab-mcp/releases), then
+check out that exact tag before running the two npm commands. A source checkout
+also works before the first GitHub release is published. npm installs the source
+and its dependencies; no npm login or connector registry publication is required.
 
 ## Connection and enrollment
 
@@ -232,13 +238,25 @@ pending events. Reporting requires the server's `/api/agent/identity` endpoint;
 update the server first if the identity check is unavailable. The log must match that exact session and
 repository. The first read establishes a baseline; subsequent reads run every
 30 seconds and send changed session token totals to Runner activity. Prompts,
-code and tool arguments are excluded. These observations do not add billing
-charges or update cost totals. `--once --report` only establishes the baseline.
+code and tool arguments are excluded. When the server advertises native accounting,
+post-baseline token deltas also update Stats through `/api/usage/report`; pricing
+remains server-side. The first accepted automated reporter owns that native session.
+Other reporters receive a successful suppression acknowledgement without adding
+cost or blocking their worker. Reusing the state directory preserves the accounting
+window and pending retries. Older servers receive activity only. `--once --report`
+only establishes the baseline.
 Unsent observations stay in the local outbox on stop. Invalid logs pause reporting;
 authentication failures stop the watcher. Quiet logs never imply an agent signed off.
 Codex also reports the latest explicit turn start, completion or abort after the
 baseline read. A turn finishing does not mark the session offline. Claude turn
 lifecycle reporting is not yet supported; its token observations remain available.
+For either client, add `--session-pid <coding-client-pid>` to observe its actual
+process departure. The PID must be alive and the session log must verify at startup.
+A confirmed process exit reports Client disconnected and ends the watcher. The
+server marks the agent offline only while that runtime still owns its latest
+presence and no other runtime reported recently. Newer MCP work, ambiguous process
+access and missing lifecycle evidence retain normal presence expiry. PID reuse
+can delay departure detection; it never triggers a guessed disconnect.
 On supporting servers, native reporting discovers the agent's current active,
 owned task without extra flags. This is observational only: it neither claims
 work nor renews the discovered lease. With `--task <id> --lease <version>`, new turn activity includes the task only
@@ -253,6 +271,15 @@ Changes after the baseline are queued for the website's Runner activity panel.
 This requires a server version supporting workspace observations; older servers
 reject the new event and pause reporting. Codex branch changes and files omitted
 from its structured log remain unknown; the watcher never guesses from a shared checkout.
+
+On supporting servers, Codex native subscription-limit events also update the
+agent's allowance meter. Claude reports its five-hour and seven-day allowance
+through the existing statusline relay when that client supplies `rate_limits`.
+Context-window percentages are never treated as subscription allowance. Missing
+or unsupported reports remain unknown; positive reports become stale after ten
+minutes. A confirmed limit remains until its reported reset, then becomes unknown
+until the next provider report. Only provider, window, remaining percentage,
+observation time and reset time are stored; no account identifier is required.
 
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
@@ -331,10 +358,12 @@ the structured usage their clients emit, often at turn completion.
 Worker and supervisor reports also retain `native_session: {client, id}` when
 Codex or Claude supplies a native session UUID. This correlation metadata does
 not replace the existing billing session or event ID, reset cumulative counters,
-or grant accounting ownership. Fresh invocations never inherit an earlier
-session's identity when the current client has not reported one. Older servers
-ignore this optional metadata; native watch billing remains disabled until the
-shared accounting contract is implemented.
+or reset cumulative counters. On supporting servers, it identifies the shared
+accounting fence across native watchers, workers, supervisors and statusline reports.
+Fresh invocations never inherit an earlier session's identity when the current
+client has not reported one. Update every collector before using native accounting:
+old collectors and manual estimates without native identity cannot be correlated.
+Reports without a verified native UUID retain their existing accounting behavior.
 
 Readers check the exact session and workspace, file identity, append-only
 content, counter consistency and deadlines. Explicit native resume subtracts a
@@ -361,16 +390,26 @@ explicit-resume acceptance remain to be tested. At the last provider probe,
 Claude Code 2.1.139 was logged out and Gemini CLI 0.58.0 had no configured
 authentication method.
 Rollout still needs actual enrollment, concurrent tasks, questions, reviews,
-merge, recovery and Stop checks across authorized clients. The owned npm package
-returned 404 at the last release check; public source/export alone is not a
-successful registry publication.
+merge, recovery and Stop checks across authorized clients.
 
-`update-check` checks the exact owned npm package/repository identity and never
-upgrades an active worker. The public repository's manually dispatched
-`connector-release.yml` workflow requires an exact committed version, tests the
-package, publishes with provenance and verifies the registry artifact. Normal
-releases use configured npm OIDC trusted publishing. First publication may
-require the owner's explicit bootstrap setup; a source export or passing test
-is not a completed publication. Keep all release credentials out of source and
-chat. [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/),
-[provenance](https://docs.npmjs.com/generating-provenance-statements/).
+`update-check` reads the public repository's latest stable GitHub release and
+checks its tag and repository URLs. It never installs anything or upgrades an
+active worker. No published release returns `unreleased`; a rate limit or failed
+request returns `unavailable`, preserving the previous confirmed cache. Missing
+releases and rate limits use a short backoff, respecting Retry-After up to one day.
+
+To release, a maintainer first creates and pushes `vVERSION` at the reviewed
+standalone main commit whose package.json contains VERSION. Manually dispatch
+`connector-release.yml` on that same main commit with VERSION. The workflow checks
+the existing tag against the clean checkout, runs tests and syntax checks, packs
+the connector, and creates a draft GitHub release with the archive and its SHA-256
+file. It downloads the archive again, compares it byte for byte, and rechecks the
+tag before publishing. A failed verification leaves a draft. Existing releases
+are never overwritten. Configure required reviewers on the `connector-release`
+environment before the first dispatch. There is no automatic tag trigger or npm
+publishing credential; `private: true` prevents accidental npm publication.
+The `.tgz` asset is an installable package (`npm install -g ./downloaded-file.tgz`),
+not the full development checkout. Use the matching GitHub tag checkout with
+`npm ci` to run tests or develop the connector.
+`node scripts/prepare-release.mjs VERSION` verifies source/tag identity without
+publishing. Source export and passing local tests are not a published release.

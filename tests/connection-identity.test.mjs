@@ -7,6 +7,12 @@ import { activityConnectionScope, readConnectionIdentity } from '../bin/connecti
 import { createActivityReporter } from '../bin/activity.mjs';
 
 const identity = { projectId: 'project-one', agentId: 'agent-one' };
+test('only explicit supported server versions enable allowance and native accounting', async () => {
+  for (const version of [1, 2, undefined, '1']) {
+    const result = await readConnectionIdentity({ server: 'https://example.test', token: 'x', fetch: async () => new Response(JSON.stringify({ project_id: identity.projectId, agent_id: identity.agentId, native_accounting: version, subscription_allowance: version })) });
+    assert.deepEqual(result, { ...identity, ...(version === 1 ? { nativeAccounting: true, subscriptionAllowance: true } : {}) });
+  }
+});
 test('identity is authenticated, sanitized and never follows a redirect', async () => {
   let options;
   const result = await readConnectionIdentity({ server: 'https://example.test', token: 'private-token', fetch: async (url, value) => {

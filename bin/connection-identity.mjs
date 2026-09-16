@@ -21,7 +21,7 @@ export async function readConnectionIdentity({ server, token, signal, fetch: req
   if (!response.ok) throw Object.assign(new Error(`Connection identity was not accepted (${response.status}). Update the server or reconnect before reporting.`), { status: response.status });
   const body = await response.json().catch(() => { throw new Error('Connection identity response was not valid JSON.'); });
   signal?.throwIfAborted();
-  const identity = { projectId: body?.project_id, agentId: body?.agent_id };
+  const identity = { projectId: body?.project_id, agentId: body?.agent_id, ...(body?.native_accounting === 1 ? { nativeAccounting: true } : {}), ...(body?.subscription_allowance === 1 ? { subscriptionAllowance: true } : {}) };
   activityConnectionScope(url.origin, token, identity);
   return identity;
 }

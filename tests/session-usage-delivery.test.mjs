@@ -5,7 +5,7 @@ import { createNativeUsageDelivery as create } from '../bin/session-usage-delive
 import { advanceSessionUsageWindow as advance } from '../bin/session-usage-window.mjs';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const options = { server: 'http://localhost', token: 'test-token', projectId: 'fixture-project', agentId: 'fixture-agent', source: 'client_json' };
+const options = { server: 'http://localhost', token: 'test-token', projectId: 'fixture-project', agentId: 'fixture-agent', source: 'client_json', nativeSession: { client: 'codex', id: '01a07a24-a447-75b3-890e-ceb683c31bfe' } };
 function report(connectionScope) {
   const identity = { client: 'codex', sessionId: '01a07a24-a447-75b3-890e-ceb683c31bfe', connectionScope };
   const row = n => ({ model: 'gpt-6-astra', token_semantics: 'inclusive', input_tokens: n, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 });

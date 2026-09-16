@@ -68,12 +68,26 @@ test('watch recovery does not retry rejected credentials', async () => {
   }, ['--keep-alive']);
 });
 
-async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false, identityStatus = 200) {
+test("watch reports its loaded connector and warns once across repeated outdated responses", async () => {
+  let calls = 0;
+  await fixture(async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk;
+    const report = JSON.parse(body).connector;
+    assert.match(report.version, /^\d+\.\d+\.\d+$/);
+    assert.equal(report.restart_required, false);
+    response.end(JSON.stringify({ next_seq:0, events:[], connector:{minimum:'999.0.0',recommended:'999.0.0'}, stop_requested:++calls === 3 }));
+  }, ({code,stderr,status}) => {
+    assert.equal(code,0,stderr);
+    assert.equal(status.connector.state,'outdated');
+    assert.equal((stderr.match(/Connector needs attention/g) ?? []).length,1);
+  });
+});
+async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false, identityStatus = 200, nativeAccounting = false) {
   const directory = mkdtempSync(join(tmpdir(), "ehgi-watch-test-"));
   const server = createServer((request, response) => {
     if (request.url === '/api/agent/identity') {
       assert.equal(request.headers.authorization, 'Bearer test-secret-never-in-status');
-      response.writeHead(identityStatus).end(JSON.stringify({ project_id: 'fixture-project', agent_id: 'fixture-agent' }));
+      response.writeHead(identityStatus).end(JSON.stringify({ project_id: 'fixture-project', agent_id: 'fixture-agent', ...(nativeAccounting ? { native_accounting: 1 } : {}) }));
       return;
     }
     return handle(request, response, directory, child);
@@ -208,6 +222,45 @@ test('watch --report uploads changed native session counters without billing or 
     ].map(row => JSON.stringify(row)).join('\n') + '\n');
     return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
   }, 85000);
+});
+
+test('native accounting excludes history and a verified process exit reports session end', async () => {
+  const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+  const usage = input => ({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 10, cached_input_tokens: 20 } } } });
+  const packets = [], reports = [];
+  let nativeChild, appended = false;
+  try {
+    await fixture(async (request, response, directory) => {
+      let text = ''; for await (const chunk of request) text += chunk;
+      const body = JSON.parse(text);
+      if (request.url === '/api/agent/watch') {
+        if (!appended) { appended = true; appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n`); nativeChild.kill(); }
+        return; // The watch request is cancelled once the client departure is delivered.
+      }
+      if (request.url === '/api/agent/activity') {
+        packets.push(body);
+        response.end(JSON.stringify({ acceptedThrough: body.events.at(-1).sequence }));
+      } else if (request.url === '/api/usage/report') {
+        reports.push(body);
+        response.end(JSON.stringify({ ok: true, duplicate: false, id: createHash('sha256').update(JSON.stringify(['fixture-agent', body.event_id])).digest('hex').slice(0, 40) }));
+      } else response.writeHead(404).end();
+    }, ({ code, stderr, status }) => {
+      assert.equal(code, 0, stderr);
+      assert.equal(status.reason, 'native_session_ended');
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0].input_tokens, 100);
+      assert.equal(reports[0].output_tokens, 0);
+      assert.deepEqual(reports[0].native_session, { client: 'codex', id: sessionId });
+      assert.equal(reports[0].accounting_reporter, 'native');
+      assert.equal(packets.flatMap(packet => packet.events).at(-1).kind, 'session_ended');
+      assert(!JSON.stringify({ packets, reports }).includes('PRIVATE'));
+    }, directory => {
+      nativeChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+      const file = join(directory, 'session.jsonl');
+      writeFileSync(file, [{ type: 'session_meta', payload: { id: sessionId, cwd: directory } }, { type: 'turn_context', payload: { model: 'gpt-6-astra' } }, { type: 'message', text: 'PRIVATE' }, usage(100)].map(row => JSON.stringify(row)).join('\n') + '\n');
+      return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory, '--session-pid', String(nativeChild.pid)];
+    }, 45000, false, 200, true);
+  } finally { if (nativeChild?.exitCode === null) nativeChild.kill(); }
 });
 
 test('native Claude edit metadata reaches the activity endpoint without content or absolute paths', async () => {

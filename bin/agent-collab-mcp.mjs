@@ -19,6 +19,7 @@ import { recoverWatch } from "./watch-recovery.mjs";
 import { createWatchTaskContext } from "./watch-task-context.mjs";
 import { acquireWorkerLock } from "./worker-lock.mjs";
 import { setTimeout as watchDelay } from "node:timers/promises";
+import { createConnectorDiagnostics } from "./connector-version.mjs";
 
 const [command, ...rest] = process.argv.slice(2);
 const flags = {};
@@ -60,10 +61,10 @@ function usage(code = 0) {
   supervise --host <url> --client codex|claude-code|gemini-cli [--cwd <repo>] [--write] [--retry-failed]
   watch --host <url> [--task <id> --lease <version>] [--state <directory>] [--once] [--keep-alive]
         [--report --client codex|claude-code --session <UUID> --session-file <absolute path> --cwd <absolute repo>]
-        --report sends session token observations, not billable usage; it never resumes a model
+        --report sends native activity and, on supporting servers, post-baseline usage; it never resumes a model
   doctor --host <url> [--client <name>] [--report] check connection/config (reads AGENT_COLLAB_TOKEN;
            --report tells the hub how far this machine got, for the Connect panel)
-  update-check                  check this owned package for a newer release
+  update-check                  check GitHub for a newer connector release
   serve --host <url>            stdio bridge (reads AGENT_COLLAB_TOKEN)
   env <token>                   print how to set AGENT_COLLAB_TOKEN on this OS
 `);
@@ -199,6 +200,7 @@ async function doctor() {
 }
 
 async function watch() {
+  const diagnostics = createConnectorDiagnostics();
   const base = host();
   const token = process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error("Set AGENT_COLLAB_TOKEN before running watch.");
@@ -248,10 +250,10 @@ async function watch() {
   try {
   if (cancellation.signal.aborted) return;
   if (flags.report === 'true') {
-    observations = await startWatchObservations({ client: flags.client, sessionId: flags.session, sessionFile: flags['session-file'], cwd: flags.cwd,
+    observations = await startWatchObservations({ client: flags.client, sessionId: flags.session, sessionFile: flags['session-file'], sessionPid: flags['session-pid'] === undefined ? undefined : Number(flags['session-pid']), cwd: flags.cwd,
       server: base, token, directory, signal: cancellation.signal, currentTask: () => taskContext.current(),
       onStatus: reporting => status({ reporting }),
-      onAuthenticationFailure: () => stop('authentication_required', 1) });
+      onAuthenticationFailure: () => stop('authentication_required', 1), onSessionEnd: () => stop('native_session_ended', 0) });
     status({ mode: 'events_with_observations' });
   }
   do {
@@ -260,7 +262,7 @@ async function watch() {
       const response = await fetch(`${base}/api/agent/watch`, {
         method: "POST", signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(55000)]),
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ since_seq: cursor, passive: true, ...(flags.report === 'true' ? { include_task_context: true } : {}), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
+        body: JSON.stringify({ since_seq: cursor, passive: true, connector: diagnostics.report(), ...(flags.report === 'true' ? { include_task_context: true } : {}), ...(flags.task ? { task_id: flags.task, lease_version: Number(flags.lease) } : {}) }),
       });
       if ([400, 401, 403, 404, 409].includes(response.status)) {
         const reason = response.status === 401 || response.status === 403 ? "authentication_required" : response.status === 409 ? "lease_conflict" : "configuration_required";
@@ -274,6 +276,7 @@ async function watch() {
       }
       const result = await response.json();
       if (cancellation.signal.aborted) return;
+      status({ connector: diagnostics.observe(result.connector) });
       if (!Number.isSafeInteger(result.next_seq) || result.next_seq < cursor || !Array.isArray(result.events)) throw new Error("Invalid watch response.");
       if (result.stop_requested) taskContext.clear();
       else taskContext.confirm(requestStartedAt, result.task_context);

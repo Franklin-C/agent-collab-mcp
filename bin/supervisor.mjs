@@ -6,11 +6,13 @@ import { nativeUsageSession } from './native-usage-session.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { inspectClient, runClient } from './client-adapters.mjs';
 import { createActivityReporter } from './activity.mjs';
+import { createConnectorDiagnostics } from './connector-version.mjs';
 
 const delay = (ms, signal) => new Promise(resolve => { const timer = setTimeout(done, ms); function done() { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); } signal.addEventListener('abort', done, { once: true }); if (signal.aborted) done(); });
 
 /** The poller renews presence independently of the single, bounded client worker. */
 export async function supervise(options) {
+  const diagnostics = createConnectorDiagnostics();
   const token = options.token ?? process.env.AGENT_COLLAB_TOKEN;
   if (!token) throw new Error('Set AGENT_COLLAB_TOKEN before supervising.');
   const cwd = realpathSync(options.cwd ?? process.cwd());
@@ -77,7 +79,7 @@ export async function supervise(options) {
           const reports = collectUsage(event);
           if (!reports.length) return;
           const nativeSession = nativeUsageSession(capability.client, event, observedSessionId);
-          state.usage.push(...reports.map(report => ({ ...report, ...(nativeSession ? { native_session: nativeSession } : {}), event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
+          state.usage.push(...reports.map(report => ({ ...report, ...(nativeSession ? { native_session: nativeSession, accounting_reporter: 'supervisor' } : {}), event_id: `${turnId}-${reportOrdinal++}`, source: 'cli_stream', ...(options.phase ? { phase: options.phase } : {}), ...(options.task ? { task_id: options.task } : {}), session_id: turnId, note: report.note ?? 'Observed supervisor provider totals; no inferred counts.' })));
           persist();
           void flushUsage();
         },
@@ -116,10 +118,11 @@ export async function supervise(options) {
       // persisted work, including the first batch after a process restart.
       await flushUsage();
       try {
-        const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/watch`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(55000)]), body: JSON.stringify({ since_seq: state.cursor, ...(options.task ? { task_id: options.task, lease_version: Number(options.lease) } : {}) }) });
+        const response = await (options.fetch ?? fetch)(`${options.host}/api/agent/watch`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(55000)]), body: JSON.stringify({ since_seq: state.cursor, connector: diagnostics.report(), ...(options.task ? { task_id: options.task, lease_version: Number(options.lease) } : {}) }) });
         if ([400, 401, 403, 404, 409].includes(response.status)) throw Object.assign(new Error(`Watch returned ${response.status}; reconnect or resolve the lease before restarting.`), { fatal: true });
         if (!response.ok) throw new Error(`Watch returned ${response.status}.`);
         const data = await response.json();
+        state.connector = diagnostics.observe(data.connector); persist();
         if (data.stop_requested) { stop(); break; }
         if (!Number.isSafeInteger(data.next_seq) || data.next_seq < state.cursor || !Array.isArray(data.events)) throw new Error('Invalid watch response.');
         if (state.pending.length + data.events.length > 2000) throw Object.assign(new Error('Pending event limit reached; resolve the paused client before restarting. Cursor retained.'), { fatal: true });

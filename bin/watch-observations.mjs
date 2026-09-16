@@ -5,15 +5,20 @@ import { createActivityReporter } from './activity.mjs';
 import { createSessionFileObserver } from './session-observation-file.mjs';
 import { createSessionActivityRecorder } from './session-activity.mjs';
 import { readConnectionIdentity } from './connection-identity.mjs';
+import { createNativeUsageDelivery } from './session-usage-delivery.mjs';
+import { createSessionUsageOutbox } from './session-usage-outbox.mjs';
+import { createSessionProcessMonitor } from './session-process.mjs';
 
-/** Passive native observations, never billable usage or permission to run a model. */
+/** Passive observations and fenced usage reporting; never permission to run a model. */
 export async function startWatchObservations(options) {
   const { client, sessionId, sessionFile, cwd, server, token, directory, signal } = options;
   if (!['codex', 'claude-code'].includes(client) || !sessionId || !sessionFile || !cwd || !isAbsolute(sessionFile) || !isAbsolute(cwd) || !signal) {
     throw new Error('watch --report requires --client codex|claude-code, --session <UUID>, --session-file <absolute path> and --cwd <absolute repository path>.');
   }
   const observe = createSessionFileObserver(sessionFile, { client, sessionId, cwd, signal });
+  const clientProcess = createSessionProcessMonitor(options.sessionPid);
   const baseline = await observe();
+  if (clientProcess && !observe.isVerified()) throw new Error('Process monitoring requires a log with verified session and repository identity.');
   let lastTurn = JSON.stringify(observe.turnState());
   let lastWorkspace = JSON.stringify(observe.workspaceMetadata());
   signal.throwIfAborted();
@@ -40,13 +45,37 @@ export async function startWatchObservations(options) {
       onError: error => fail(error.permanent ? error : Object.assign(error, { retryable: true })) });
     const recorder = createSessionActivityRecorder({ client, sessionId, connectionScope: scope, reporter });
     recorder.record(baseline);
+    let lastAllowance = null;
+    const reportAllowance = () => {
+      if (!connectionIdentity.subscriptionAllowance) return;
+      const allowance = observe.allowanceSnapshot(), key = JSON.stringify(allowance);
+      if (allowance && key !== lastAllowance && reporter.record({ kind: 'allowance_reported', allowance }, { runId: sessionId })) lastAllowance = key;
+    };
+    reportAllowance();
+    if (clientProcess) reporter.record({ kind: 'session_started' }, { runId: sessionId });
+    const delivery = connectionIdentity.nativeAccounting ? createNativeUsageDelivery({ server, token, ...connectionIdentity, source: 'client_json', nativeSession: { client, id: sessionId }, signal: controller.signal }) : null;
+    const outbox = delivery ? createSessionUsageOutbox({ statePath: join(directory, `usage-${scope.slice(0, 20)}.json`), client, sessionId, connectionScope: delivery.connectionScope }) : null;
+    outbox?.record(baseline);
+    let billingPaused = false;
     status('waiting');
     const run = (async () => {
       while (!controller.signal.aborted) {
         await delay(30_000, undefined, { signal: controller.signal });
+        const ended = clientProcess?.ended();
         const snapshot = await observe();
         controller.signal.throwIfAborted();
         const accepted = recorder.record(snapshot);
+        reportAllowance();
+        if (outbox && !billingPaused) {
+          outbox.record(snapshot);
+          try { await outbox.flush(report => delivery.deliver(report, controller.signal)); }
+          catch (error) {
+            if (controller.signal.aborted) throw error;
+            if ([401, 403].includes(error.status)) throw error;
+            if (error.retryable !== true) billingPaused = true;
+            options.onStatus?.({ billing: billingPaused ? 'paused' : 'retrying', reason: error.status === 409 ? 'another_accounting_reporter' : 'usage_delivery_unavailable' });
+          }
+        }
         const workspace = observe.workspaceMetadata();
         const workspaceKey = JSON.stringify(workspace);
         const workspaceAccepted = workspace && workspaceKey !== lastWorkspace && reporter.record({ kind: 'workspace_observed', workspace }, { runId: sessionId });
@@ -62,6 +91,13 @@ export async function startWatchObservations(options) {
         // Provider counters may arrive in a later scan than task_complete.
         // Restore the explicit state after those counters as well.
         if (turn && (turnKey !== lastTurn || accepted || workspaceAccepted) && reporter.record({ kind: turn.kind }, { runId: sessionId, ...(taskId ? { taskId } : {}) })) lastTurn = turnKey;
+        if (ended) {
+          reporter.record({ kind: 'session_ended' }, { runId: sessionId });
+          await reporter.flush();
+          status('stopped', 'native_session_ended');
+          options.onSessionEnd?.();
+          break;
+        }
         status(accepted ? 'observed' : 'waiting');
       }
     })().catch(error => { if (!controller.signal.aborted) fail(error); });

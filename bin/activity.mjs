@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { activityConnectionScope } from './connection-identity.mjs';
+import { safeAllowance } from './subscription-allowance.mjs';
 
-const kinds = new Set(['run_started', 'run_finished', 'run_failed', 'run_stopped', 'tool_started', 'tool_finished', 'file_changed', 'usage_reported', 'workspace_observed', 'needs_permission', 'needs_authentication', 'waiting', 'waiting_review', 'waiting_dependency']);
+const kinds = new Set(['allowance_reported', 'session_started', 'session_ended', 'run_started', 'run_finished', 'run_failed', 'run_stopped', 'tool_started', 'tool_finished', 'file_changed', 'usage_reported', 'workspace_observed', 'needs_permission', 'needs_authentication', 'waiting', 'waiting_review', 'waiting_dependency']);
 const families = new Set(['command', 'file', 'mcp', 'search', 'other']);
 const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
 const validCount = value => Number.isSafeInteger(value) && value >= 0;
@@ -12,6 +13,11 @@ const validCount = value => Number.isSafeInteger(value) && value >= 0;
 export function safeActivity(raw) {
   if (!raw || !kinds.has(raw.kind)) return null;
   const event = { kind: raw.kind };
+  if (raw.kind === 'allowance_reported') {
+    const allowance = safeAllowance(raw.allowance);
+    if (!allowance) return null;
+    event.allowance = allowance;
+  }
   if (raw.kind === 'workspace_observed') {
     const value = raw.workspace;
     if (!value || !(value.branch === null || typeof value.branch === 'string' && value.branch.length > 0 && value.branch.length <= 200 && !/[\x00-\x20\x7f]/.test(value.branch))

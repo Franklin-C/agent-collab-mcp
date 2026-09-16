@@ -377,7 +377,7 @@ export async function work(options) {
           onUsage: raw => {
             const batch = collectUsage(raw);
             const nativeSession = nativeUsageSession(capability.client, raw, observedSessionId);
-            for (const report of batch) { state.usage.push({ ...report, ...(nativeSession ? { native_session: nativeSession } : {}), source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); }
+            for (const report of batch) { state.usage.push({ ...report, ...(nativeSession ? { native_session: nativeSession, accounting_reporter: 'worker' } : {}), source: 'cli_stream', phase: taskId ? 'implementation' : 'coordination', task_id: taskId ?? job.id, session_id: runId, event_id: `${runId}-${reports++}` }); persist(); }
             // Deliver passive counts, then evaluate the budget promptly on the
             // same serialized heartbeat chain used for lease renewal and Stop.
             if (batch.length) queuePulse();

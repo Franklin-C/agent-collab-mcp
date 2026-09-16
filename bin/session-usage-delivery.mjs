@@ -8,6 +8,8 @@ const invalid = () => new Error('Native usage delivery requires verified report 
 /** Construct transport only. Callers must establish exclusive accounting authority before sending. */
 export function createNativeUsageDelivery(options) {
   options = { ...options };
+  if (!['codex', 'claude-code'].includes(options.nativeSession?.client) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.nativeSession?.id ?? '')) throw invalid();
+  const nativeSession = { client: options.nativeSession.client, id: options.nativeSession.id.toLowerCase() };
   const server = new URL(options.server);
   if (server.username || server.password || server.search || server.hash || server.pathname !== '/'
     || server.protocol !== 'https:' && !(server.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(server.hostname))) throw invalid();
@@ -30,7 +32,7 @@ export function createNativeUsageDelivery(options) {
         || !Number.isSafeInteger(raw.input_tokens + raw.output_tokens + (raw.token_semantics === 'anthropic' ? raw.cache_read_tokens + raw.cache_write_tokens : 0))) throw invalid();
       const delta = { model: raw.model, token_semantics: raw.token_semantics, ...Object.fromEntries(countFields.map(field => [field, raw[field]])) };
       if (raw.event_id !== hash([raw.session_id.slice(7), delta])) throw invalid();
-      const body = { ...delta, cumulative: true, session_id: raw.session_id, event_id: raw.event_id, source: options.source };
+      const body = { ...delta, cumulative: true, session_id: raw.session_id, event_id: raw.event_id, source: options.source, native_session: nativeSession, accounting_reporter: 'native' };
       let result;
       try {
         const signals = [options.signal, cycleSignal].filter(Boolean);
