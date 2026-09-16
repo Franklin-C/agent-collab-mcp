@@ -55,7 +55,7 @@ function usage(code = 0) {
 
   connect <token> --host <url> [--client claude-code|codex|cursor|gemini-cli|antigravity|grok|muse-code|vscode|windsurf] [--profile <codex-profile>] [--print]
   startup --state <dir> [--install --repo <repo> --host <url> --client <client> --model <model> --profile <codex-profile> --write | --uninstall | --reset-recovery]
-  enroll --host <url> --client <client> --repo <repo> --write [--model <model>] [--profile <codex-profile>] [--configure] [--start]
+  enroll --host <url> --client <client> --repo <repo> --write [--model <model>] [--profile <codex-profile>] [--mcp-server <claude-server-name>] [--configure] [--start]
   cleanup --repo <repo> --state <worker-state> [--base main] [--verify-github] [--apply]
   worker --host <url> --client codex|claude-code|gemini-cli --repo <approved-repo> --write [--model <model>] [--profile <codex-profile>] [--once]
   supervise --host <url> --client codex|claude-code|gemini-cli [--cwd <repo>] [--write] [--retry-failed]
@@ -491,32 +491,34 @@ if (flags.profile !== undefined) {
   codexProfileName(flags.profile);
   if (flags.client !== 'codex' || !['connect', 'doctor', 'enroll', 'worker', 'startup'].includes(command)) throw new Error('--profile is supported only for Codex connect, doctor, enroll, worker, and startup commands.');
 }
+if (flags["mcp-server"] !== undefined && (flags.client !== "claude-code" || !["enroll", "worker", "supervise", "startup"].includes(command))) throw new Error("--mcp-server is supported only for Claude Code enrollment, workers, supervisors and startup.");
 switch (command) {
   case "update-check":
     console.log(JSON.stringify(await checkUpdate({ force: true })));
     break;
   case "startup":
-    console.log(JSON.stringify(await manageStartup({ action: flags.install === "true" ? "install" : flags.uninstall === "true" ? "uninstall" : flags['reset-recovery'] === 'true' ? 'reset' : "status", install: flags.install === "true", uninstall: flags.uninstall === "true", resetRecovery: flags['reset-recovery'] === 'true', write: flags.write === "true", repo: flags.repo, state: flags.state, host: flags.host, client: flags.client, model: flags.model, profile: flags.profile, executable: flags.executable }), null, 2));
+    console.log(JSON.stringify(await manageStartup({ action: flags.install === "true" ? "install" : flags.uninstall === "true" ? "uninstall" : flags['reset-recovery'] === 'true' ? 'reset' : "status", install: flags.install === "true", uninstall: flags.uninstall === "true", resetRecovery: flags['reset-recovery'] === 'true', write: flags.write === "true", repo: flags.repo, state: flags.state, host: flags.host, client: flags.client, model: flags.model, profile: flags.profile, mcpServer: flags["mcp-server"], executable: flags.executable }), null, 2));
     break;
   case "cleanup":
     console.log(JSON.stringify(cleanupLocalWorktrees({ repo: flags.repo, state: flags.state, base: flags.base, apply: flags.apply === "true", verifyGitHub: flags["verify-github"] === "true" }), null, 2));
     break;
   case "enroll": {
+    if (flags.configure === "true" && flags["mcp-server"] && flags["mcp-server"] !== "agent-collab") throw new Error("--mcp-server selects an existing Claude connection. Configure that named connection first and omit --configure.");
     if (flags.configure === "true") connect();
-    const options = { host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile };
+    const options = { host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile, mcpServer: flags["mcp-server"] };
     const result = await enroll(options);
     console.log(JSON.stringify(result));
     if (flags.start === "true") await work({ ...options, state: result.state });
     break;
   }
   case "worker":
-    await work({ host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile, once: flags.once === "true" });
+    await work({ host: host(), client: flags.client, executable: flags.executable, repo: flags.repo, state: flags.state, label: flags.label, write: flags.write === "true", model: flags.model, profile: flags.profile, mcpServer: flags["mcp-server"], once: flags.once === "true" });
     break;
   case "supervise":
     await checkUpdate();
     if (flags.task && (!flags.lease || !Number.isSafeInteger(Number(flags.lease)))) throw new Error("--task requires an integer --lease version.");
     if (flags.phase && !["coordination", "implementation", "review"].includes(flags.phase)) throw new Error("--phase must be coordination, implementation, or review.");
-    await supervise({ phase: flags.phase, host: host(), client: flags.client, cwd: flags.cwd, state: flags.state, write: flags.write === "true", retryFailed: flags["retry-failed"] === "true", resume: flags.resume === "true", task: flags.task, lease: flags.lease, model: flags.model, once: flags.once === "true" });
+    await supervise({ mcpServer: flags["mcp-server"], phase: flags.phase, host: host(), client: flags.client, cwd: flags.cwd, state: flags.state, write: flags.write === "true", retryFailed: flags["retry-failed"] === "true", resume: flags.resume === "true", task: flags.task, lease: flags.lease, model: flags.model, once: flags.once === "true" });
     break;
   case "watch": {
     if (flags['keep-alive'] !== 'true') { await watch(); break; }

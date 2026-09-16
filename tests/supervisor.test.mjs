@@ -12,6 +12,16 @@ function setup(t) { const dir=mkdtempSync(join(tmpdir(),'collab-supervisor-')); 
 const response = data => new Response(JSON.stringify(data),{status:200});
 test('idle watch never starts a model',async t=>{let turns=0;const r=await supervise({...setup(t),fetch:async()=>response({next_seq:8,events:[]}),runClient:async()=>{turns++;}});assert.equal(turns,0);assert.equal(r.cursor,8);});
 
+test('a Claude supervisor scopes the prompt and grants to one configured alias', async t => {
+  await supervise({ ...setup(t), capability: { ...capability, client: 'claude-code' }, mcpServer: 'agent-collab-ehgi',
+    fetch: async () => response({ next_seq: 1, events: [{ seq: 1 }] }), runClient: async (_client, prompt, run) => {
+      assert.match(prompt, /configured agent-collab-ehgi MCP tools/);
+      assert.deepEqual(run.allowedTools, ['mcp__agent-collab-ehgi__*']);
+      return { completed: true };
+    },
+  });
+});
+
 test('supervisor attaches the observed native session without replacing its accounting run', async t => {
   const id = '01900000-0000-7000-8000-000000000001', reports = [];
   await supervise({ ...setup(t), model: 'gpt-5', fetch: async (url, request) => {
@@ -67,6 +77,19 @@ for (const reason of ['stop', 'revoked', 'lost lease']) {
     assert.equal(state.cursor, 1);
   });
 }
+
+test('a replayed watch packet never duplicates the durable pending event', async t => {
+  const options = setup(t);
+  let turns = 0;
+  await supervise({ ...options, once: false,
+    fetch: async () => response({ next_seq: 1, events: [{ seq: 1 }] }),
+    runClient: async () => { turns++; throw new Error('retry this work'); },
+  });
+  const state = JSON.parse(readFileSync(join(options.state, 'state.json')));
+  assert.equal(turns, 3);
+  assert.deepEqual(state.pending, [{ seq: 1 }]);
+  assert.equal(state.cursor, 1);
+});
 
 test('independent agent supervisors execute concurrently without sharing session state', { timeout: 5000 }, async t => {
   let started = 0;

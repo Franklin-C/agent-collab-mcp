@@ -70,16 +70,24 @@ function selectedProfile(capability, options) {
   if (profile && !options.write) throw new Error('A Codex profile requires explicit --write enrollment; its permissions are selected by the operator.');
   return profile;
 }
+export function claudeMcpServer(options = {}) {
+  const name = options.mcpServer ?? 'agent-collab';
+  if (typeof name !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(name)) throw new Error('--mcp-server requires an exact MCP server name (letters, digits, underscores or dashes).');
+  return name;
+}
 export function executionBinding(capability, options = {}) {
   const profile = selectedProfile(capability, options);
+  if (options.mcpServer !== undefined && capability.client !== 'claude-code') throw new Error('--mcp-server is supported only for Claude Code.');
+  const mcpServer = capability.client === 'claude-code' ? claudeMcpServer(options) : null;
   return { version: 1, client: capability.client, clientVersion: capability.version ?? null,
+    ...(mcpServer && mcpServer !== 'agent-collab' ? { mcpServer } : {}),
     executable: capability.executable ?? null, prefixArgs: capability.prefixArgs ?? [], model: options.model ?? null,
     write: options.write === true,
     configuration: capability.client === 'codex' ? codexConfigurationBinding({ profile, env: options.env }) : null };
 }
 export function assertEnrollmentBinding(enrollment, capability, options = {}) {
   const profile = selectedProfile(capability, options);
-  if (!enrollment?.execution && !profile) return null; // Existing unprofiled workers retain their prior enrollment contract.
+  if (!enrollment?.execution && !profile && !options.mcpServer) return null; // Existing default workers retain their prior enrollment contract.
   const current = executionBinding(capability, options);
   if (!enrollment?.verifiedAt || JSON.stringify(enrollment.execution) !== JSON.stringify(current)) throw Object.assign(new Error('The client, model, Codex home, profile, or configuration differs from verified enrollment. Rerun enrollment with the exact worker options.'), { code: 'ENROLLMENT_CHANGED', retryable: false });
   return current;

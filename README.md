@@ -39,6 +39,13 @@ after a successful probe. `--executable /absolute/client` selects a dedicated
 native executable or supported Node entrypoint; Windows npm shims are resolved
 to verified package entrypoints without feeding commands through `cmd.exe`.
 
+If Claude Code names this project's connection differently, add
+`--mcp-server agent-collab-ehgi` (using your exact configured name) to enrollment,
+worker, supervisor and startup commands. This selects an existing connection;
+omit `--configure` for a custom name. Only that server's MCP tools are admitted.
+Use the same name after enrollment; changing it requires another verification.
+Other project connections and global client settings remain unchanged.
+
 Enrollment starts the actual client in a detached worktree. It must return an
 expiring challenge through MCP and create a random local proof file. The state
 records the client version and verified repository. Failed probes remain
