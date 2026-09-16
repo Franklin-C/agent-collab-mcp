@@ -127,7 +127,7 @@ export function manageStartup(options) {
   const repo = realpathSync(options.repo);
   const identity = createHash('sha256').update(`${options.host.replace(/\/+$/, '')}:${process.env.AGENT_COLLAB_TOKEN}:${repo}:${options.client}`).digest('hex');
   if (identity !== prior.identity) throw new Error('The host, repository, client or environment token differs from verified enrollment.');
-  const workerOptions = { host: options.host.replace(/\/+$/, ''), repo, state, client: options.client, model: options.model, ...(options.profile ? { profile: options.profile } : {}), executable, write: true };
+  const workerOptions = { host: options.host.replace(/\/+$/, ''), repo, state, client: options.client, model: options.model, ...(options.profile ? { profile: options.profile } : {}), ...(options.mcpServer ? { mcpServer: options.mcpServer } : {}), executable, write: true };
   for (const value of Object.values(workerOptions).filter(value => typeof value === 'string')) clean(value);
   storeCredential(platform, label, state, process.env.AGENT_COLLAB_TOKEN);
   if (readCredential(platform, label, state) !== process.env.AGENT_COLLAB_TOKEN) throw new Error('The current-user credential store did not pass its read-back check. Startup was not registered.');

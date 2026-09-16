@@ -1,13 +1,73 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { spawn, execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from 'node:crypto';
+import { createActivityReporter } from '../bin/activity.mjs';
 
 const cli = fileURLToPath(new URL("../bin/agent-collab-mcp.mjs", import.meta.url));
+test('native reporting requires an explicit absolute state directory', () => {
+  for (const args of [[], ['--state', 'relative-state']]) {
+    assert.throws(() => execFileSync(process.execPath, [cli, 'watch', '--host', 'http://127.0.0.1:1', '--report', ...args], {
+      env: { ...process.env, AGENT_COLLAB_TOKEN: 'fixture-token' }, timeout: 5000, stdio: 'pipe',
+    }), error => error.status === 1 && /requires --state <absolute private directory>/.test(error.stderr.toString()));
+  }
+});
+
+test('watch exits when its recovery parent disconnects', async () => {
+  await fixture((_request, _response, _directory, child) => child.disconnect(), ({ code, status }) => {
+    assert.equal(code, 143);
+    assert.equal(status.reason, 'terminated');
+  }, [], 15000, true);
+});
+
+test('watch recovery replaces a crashed child and recovers its owned lock', async () => {
+  let calls = 0, crashedPid;
+  await fixture((_request, response, directory) => {
+    calls++;
+    const pid = JSON.parse(readFileSync(join(directory, 'status.json'), 'utf8')).pid;
+    if (calls === 1) {
+      crashedPid = pid;
+      // This PID belongs to the child created by this isolated fixture.
+      process.kill(pid, 'SIGKILL');
+      response.destroy();
+    } else {
+      assert.notEqual(pid, crashedPid);
+      response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+    }
+  }, ({ code, stderr, status }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(calls, 2);
+    assert.equal(status.reason, 'stop_requested');
+    assert.match(stderr, /recovery 1\/3/);
+  }, ['--keep-alive']);
+});
+
+test('watch recovery respects a hub Stop without restarting', async () => {
+  let calls = 0;
+  await fixture((_request, response) => {
+    calls++;
+    response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+  }, ({ code, status }) => {
+    assert.equal(code, 0);
+    assert.equal(calls, 1);
+    assert.equal(status.reason, 'stop_requested');
+  }, ['--keep-alive']);
+});
+
+test('watch recovery does not retry rejected credentials', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(401).end(); }, ({ code, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 1);
+    assert.equal(status.reason, 'authentication_required');
+  }, ['--keep-alive']);
+});
+
 test("watch reports its loaded connector and warns once across repeated outdated responses", async () => {
   let calls = 0;
   await fixture(async (request, response) => {
@@ -22,18 +82,27 @@ test("watch reports its loaded connector and warns once across repeated outdated
     assert.equal((stderr.match(/Connector needs attention/g) ?? []).length,1);
   });
 });
-async function fixture(handle, verify, args = []) {
+async function fixture(handle, verify, args = [], timeoutMs = 15000, ipc = false, identityStatus = 200, nativeAccounting = false) {
   const directory = mkdtempSync(join(tmpdir(), "ehgi-watch-test-"));
-  const server = createServer((request, response) => handle(request, response, directory));
+  const server = createServer((request, response) => {
+    if (request.url === '/api/agent/identity') {
+      assert.equal(request.headers.authorization, 'Bearer test-secret-never-in-status');
+      response.writeHead(identityStatus).end(JSON.stringify({ project_id: 'fixture-project', agent_id: 'fixture-agent', ...(nativeAccounting ? { native_accounting: 1 } : {}) }));
+      return;
+    }
+    return handle(request, response, directory, child);
+  });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  const child = spawn(process.execPath, [cli, "watch", "--host", `http://127.0.0.1:${server.address().port}`, "--state", directory, ...args], {
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const child = spawn(process.execPath, [cli, "watch", "--host", base, "--state", directory, ...(typeof args === 'function' ? args(directory, base) : args)], {
     env: { ...process.env, AGENT_COLLAB_TOKEN: "test-secret-never-in-status" },
+    ...(ipc ? { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] } : {}),
   });
   let stderr = "";
   child.stderr.on("data", chunk => stderr += chunk);
-  const timer = setTimeout(() => child.kill(), 15000);
+  const timer = setTimeout(() => child.kill(), timeoutMs);
   try {
-    const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on("close", resolve); });
+    const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on(ipc ? "exit" : "close", resolve); });
     await verify({ code, stderr, directory, status: JSON.parse(readFileSync(join(directory, "status.json"), "utf8")) });
     assert.equal(existsSync(join(directory, "watch.lock")), false);
     assert(!readFileSync(join(directory, "status.json"), "utf8").includes("test-secret"));
@@ -101,4 +170,207 @@ test("watch --once records failure without retrying or advancing its cursor", as
     assert.equal(status.reason, "request_failed");
     assert.equal(existsSync(join(directory, "cursor.json")), false);
   }, ["--once"]);
+});
+
+test('watch --report uploads changed native session counters without billing or private content', async () => {
+  const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+  const usage = input => ({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 10, cached_input_tokens: 20 } } } });
+  const packets = [];
+  let pendingWatch, watchCalls = 0, billingCalls = 0;
+  await fixture(async (request, response, directory) => {
+    let text = ''; for await (const chunk of request) text += chunk;
+    if (request.url === '/api/agent/activity') {
+      const packet = JSON.parse(text); packets.push(packet);
+      response.end(JSON.stringify({ acceptedThrough: packet.events.at(-1).sequence }));
+      if (packets.length === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(300))}\n`);
+      pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: packets.length === 2 }));
+    } else if (request.url === '/api/agent/watch') {
+      watchCalls++;
+      assert.equal(JSON.parse(text).include_task_context, true);
+      assert.equal(JSON.parse(text).task_id, undefined, 'automatic observation must not request lease renewal');
+      if (watchCalls === 1) appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: '01900000-0000-7000-8000-000000000099', last_agent_message: 'PRIVATE' } })}\n`);
+      if (watchCalls === 1) { response.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: false, task_context: { task_id: 'task_83', lease_version: 5, valid_for_ms: 55000 } })); return; }
+      pendingWatch = response;
+    } else { billingCalls++; response.writeHead(500).end(); }
+  }, ({ code, stderr, status }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(billingCalls, 0);
+    assert.equal(status.mode, 'events_with_observations');
+    assert.equal(status.automatic_client_resume, false);
+    assert.equal(status.reason, 'stop_requested');
+    assert.equal(packets.length, 2);
+    assert.deepEqual(packets[0].events.map(event => event.kind), ['usage_reported', 'run_finished']);
+    const { kind, inputTokens, outputTokens, usageScope, runId } = packets[0].events[0];
+    assert.deepEqual({ kind, inputTokens, outputTokens, usageScope, runId }, { kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session', runId: sessionId });
+    const latest = packets[0].events.at(-1);
+    assert.equal(latest.taskId, 'task_83');
+    assert.equal(packets[0].events[0].taskId, undefined, 'session totals must not be attributed to the current task');
+    const visibleUsage = packets[0].events.find(event => event.kind === 'usage_reported' && event.runId === latest.runId);
+    assert.equal(visibleUsage?.inputTokens, 200, 'turn completion must retain usage for the same native activity stream');
+    assert.deepEqual(packets[1].events.map(event => event.kind), ['usage_reported', 'run_finished'], 'late provider counters must not replace the completed state');
+    assert.equal(packets[1].events[0].inputTokens, 300);
+    assert.equal(packets[1].events[0].taskId, undefined);
+    assert.equal(packets[1].events.at(-1).runId, sessionId);
+    assert(!JSON.stringify(packets).includes('PRIVATE'));
+  }, directory => {
+    const file = join(directory, 'session.jsonl');
+    writeFileSync(file, [
+      { type: 'session_meta', payload: { id: sessionId, cwd: directory } },
+      { type: 'turn_context', payload: { model: 'gpt-6-astra' } },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: '01900000-0000-7000-8000-000000000099' } },
+      { type: 'message', text: 'PRIVATE' }, usage(100),
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  }, 85000);
+});
+
+test('native accounting excludes history and a verified process exit reports session end', async () => {
+  const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+  const usage = input => ({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 10, cached_input_tokens: 20 } } } });
+  const packets = [], reports = [];
+  let nativeChild, appended = false;
+  try {
+    await fixture(async (request, response, directory) => {
+      let text = ''; for await (const chunk of request) text += chunk;
+      const body = JSON.parse(text);
+      if (request.url === '/api/agent/watch') {
+        if (!appended) { appended = true; appendFileSync(join(directory, 'session.jsonl'), `${JSON.stringify(usage(200))}\n`); nativeChild.kill(); }
+        return; // The watch request is cancelled once the client departure is delivered.
+      }
+      if (request.url === '/api/agent/activity') {
+        packets.push(body);
+        response.end(JSON.stringify({ acceptedThrough: body.events.at(-1).sequence }));
+      } else if (request.url === '/api/usage/report') {
+        reports.push(body);
+        response.end(JSON.stringify({ ok: true, duplicate: false, id: createHash('sha256').update(JSON.stringify(['fixture-agent', body.event_id])).digest('hex').slice(0, 40) }));
+      } else response.writeHead(404).end();
+    }, ({ code, stderr, status }) => {
+      assert.equal(code, 0, stderr);
+      assert.equal(status.reason, 'native_session_ended');
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0].input_tokens, 100);
+      assert.equal(reports[0].output_tokens, 0);
+      assert.deepEqual(reports[0].native_session, { client: 'codex', id: sessionId });
+      assert.equal(reports[0].accounting_reporter, 'native');
+      assert.equal(packets.flatMap(packet => packet.events).at(-1).kind, 'session_ended');
+      assert(!JSON.stringify({ packets, reports }).includes('PRIVATE'));
+    }, directory => {
+      nativeChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+      const file = join(directory, 'session.jsonl');
+      writeFileSync(file, [{ type: 'session_meta', payload: { id: sessionId, cwd: directory } }, { type: 'turn_context', payload: { model: 'gpt-6-astra' } }, { type: 'message', text: 'PRIVATE' }, usage(100)].map(row => JSON.stringify(row)).join('\n') + '\n');
+      return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory, '--session-pid', String(nativeChild.pid)];
+    }, 45000, false, 200, true);
+  } finally { if (nativeChild?.exitCode === null) nativeChild.kill(); }
+});
+
+test('native Claude edit metadata reaches the activity endpoint without content or absolute paths', async () => {
+  const sessionId = '01900000-0000-7000-8000-000000000001';
+  let pending, received;
+  await fixture(async (request, response, directory) => {
+    let body = ''; for await (const chunk of request) body += chunk;
+    if (request.url === '/api/agent/watch') {
+      pending = response;
+      appendFileSync(join(directory, 'claude.jsonl'), JSON.stringify({ type: 'user', sessionId, cwd: directory, gitBranch: 'feature/a', message: { content: [{ type: 'tool_result', tool_use_id: 'edit', content: 'PRIVATE' }] } }) + '\n');
+    } else if (request.url === '/api/agent/activity') {
+      received = JSON.parse(body);
+      response.end(JSON.stringify({ acceptedThrough: received.events.at(-1).sequence }));
+      pending.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+    } else response.writeHead(500).end();
+  }, ({ code, stderr, directory }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(received.events.length, 1);
+    assert.equal(received.events[0].kind, 'workspace_observed');
+    assert.deepEqual(received.events[0].workspace, { branch: 'feature/a', files: ['a.ts'] });
+    assert.equal(received.events[0].taskId, undefined);
+    assert(!JSON.stringify(received).includes('PRIVATE'));
+    assert(!JSON.stringify(received).includes(directory));
+  }, directory => {
+    const file = join(directory, 'claude.jsonl');
+    writeFileSync(file, JSON.stringify({ type: 'assistant', sessionId, cwd: directory, gitBranch: 'feature/a', message: { id: 'message', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [{ type: 'tool_use', name: 'Edit', id: 'edit', input: { file_path: join(directory, 'a.ts'), new_string: 'PRIVATE' } }] } }) + '\n');
+    return ['--report', '--client', 'claude-code', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  }, 45000);
+});
+
+test('watch --report refuses missing session identity before any network request', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(500).end(); }, ({ code, stderr, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 0);
+    assert.match(stderr, /requires --client/);
+    assert.equal(status.reason, 'reporting_configuration_required');
+  }, ['--report']);
+});
+
+test('native watch stops before activity delivery when identity authentication fails', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(500).end(); }, ({ code, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 0);
+    assert.equal(status.reason, 'authentication_required');
+  }, directory => {
+    const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+    const file = join(directory, 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: directory } })}\n`);
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  }, 15000, false, 401);
+});
+
+test('restarted native watch replays the exact persisted observation before collecting new work', async () => {
+  const sessionId = '01a07a24-a447-75b3-890e-ceb683c31bfe';
+  let original, received, pendingWatch;
+  await fixture(async (request, response) => {
+    if (request.url === '/api/agent/watch') { pendingWatch = response; return; }
+    assert.equal(request.url, '/api/agent/activity');
+    let body = ''; for await (const chunk of request) body += chunk;
+    received = JSON.parse(body);
+    response.end(JSON.stringify({ acceptedThrough: received.events.at(-1).sequence }));
+    pendingWatch.end(JSON.stringify({ next_seq: 0, events: [], stop_requested: true }));
+  }, ({ code, stderr }) => {
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(received, { runtimeId: original.runtimeId, events: original.pending });
+  }, (directory, server) => {
+    const token = 'test-secret-never-in-status';
+    const connectionIdentity = { projectId: 'fixture-project', agentId: 'fixture-agent' };
+    const scope = createHash('sha256').update(JSON.stringify([server, connectionIdentity.projectId, connectionIdentity.agentId, 'codex', sessionId])).digest('hex');
+    const statePath = join(directory, `observations-${scope.slice(0, 20)}.json`);
+    const prior = createActivityReporter({ server, token, statePath, connectionIdentity });
+    prior.record({ kind: 'usage_reported', inputTokens: 200, outputTokens: 10, usageScope: 'session' }, { runId: sessionId });
+    prior.stop(); // Models interruption with an unacknowledged disk outbox.
+    original = JSON.parse(readFileSync(statePath, 'utf8'));
+    const file = join(directory, 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: directory } })}\n`);
+    return ['--report', '--client', 'codex', '--session', sessionId, '--session-file', file, '--cwd', directory];
+  });
+});
+
+test('native watch rejects a different session before network delivery', async () => {
+  let calls = 0;
+  await fixture((_request, response) => { calls++; response.writeHead(500).end(); }, ({ code, stderr, status }) => {
+    assert.equal(code, 1);
+    assert.equal(calls, 0);
+    assert.match(stderr, /cannot be safely observed/);
+    assert.equal(status.reason, 'reporting_configuration_required');
+  }, directory => {
+    const file = join(directory, 'session.jsonl');
+    writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: 'different-session', cwd: directory } })}\n`);
+    return ['--report', '--client', 'codex', '--session', '01a07a24-a447-75b3-890e-ceb683c31bfe', '--session-file', file, '--cwd', directory];
+  });
+});
+
+test('watch CLI recovers its dead owner lock and resumes the saved cursor', async () => {
+  await fixture(async (request, response) => {
+    let body = ''; for await (const chunk of request) body += chunk;
+    assert.equal(JSON.parse(body).since_seq, 12);
+    response.end(JSON.stringify({ next_seq: 12, events: [], stop_requested: true }));
+  }, ({ code, stderr, status }) => {
+    assert.equal(code, 0, stderr);
+    assert.equal(status.seq, 12);
+    assert.equal(status.reason, 'stop_requested');
+  }, (directory, server) => {
+    const identity = createHash('sha256').update(`${server}:test-secret-never-in-status`).digest('hex').slice(0, 20);
+    const module = new URL('../bin/worker-lock.mjs', import.meta.url).href;
+    execFileSync(process.execPath, ['--input-type=module', '-e', `import { acquireWorkerLock } from ${JSON.stringify(module)}; acquireWorkerLock(process.argv[1], process.argv[2], { name: 'watch' });`, directory, `watch:${identity}`]);
+    writeFileSync(join(directory, 'cursor.json'), JSON.stringify({ seq: 12 }));
+    return [];
+  });
 });

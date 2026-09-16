@@ -7,6 +7,23 @@ import { randomUUID } from 'node:crypto';
 import { enroll } from '../bin/enroll.mjs';
 import { git, readHandoff } from '../bin/worker.mjs';
 import { configureCodex } from '../bin/codex-config.mjs';
+import { assertEnrollmentBinding, claudeMcpServer } from '../bin/client-adapters.mjs';
+
+test('Claude enrollment scopes tools and its saved binding to the selected server', async t => {
+  const options = fixture(t), capability = { client: 'claude-code', compatible: true, version: 'fixture' };
+  await enroll({ ...options, capability, mcpServer: 'agent-collab-ehgi', runClient: async (_client, prompt, run) => {
+    assert.match(prompt, /configured agent-collab-ehgi MCP server/);
+    assert.deepEqual(run.allowedTools, ['mcp__agent-collab-ehgi__*']);
+    writeFileSync(join(run.cwd, prompt.match(/into (\.ehgi-enrollment-[a-f0-9-]+)/)[1]), JSON.parse(prompt.match(/Write exactly ("[^"]+") into/)[1]));
+    run.onUsage({ type: 'result', modelUsage: { first: { inputTokens: 10, outputTokens: 2 } } });
+    return { completed: true };
+  } });
+  const enrollment = JSON.parse(readFileSync(join(options.state, 'state.json'))).enrollment;
+  assert.doesNotThrow(() => assertEnrollmentBinding(enrollment, capability, { ...options, mcpServer: 'agent-collab-ehgi' }));
+  assert.throws(() => assertEnrollmentBinding(enrollment, capability, options), /differs/);
+  assert.throws(() => assertEnrollmentBinding({ verifiedAt: 'legacy' }, capability, { ...options, mcpServer: 'agent-collab-ehgi' }), /differs/);
+  for (const mcpServer of ['', '*', 'other::*', 'name with spaces', 'x'.repeat(81)]) assert.throws(() => claudeMcpServer({ mcpServer }), /exact MCP server name/);
+});
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'ehgi-enrollment-')), repo = join(root, 'repo'), state = join(root, 'state'), codexHome = join(root, 'codex'); mkdirSync(repo); mkdirSync(codexHome);

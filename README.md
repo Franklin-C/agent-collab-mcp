@@ -39,6 +39,13 @@ after a successful probe. `--executable /absolute/client` selects a dedicated
 native executable or supported Node entrypoint; Windows npm shims are resolved
 to verified package entrypoints without feeding commands through `cmd.exe`.
 
+If Claude Code names this project's connection differently, add
+`--mcp-server agent-collab-ehgi` (using your exact configured name) to enrollment,
+worker, supervisor and startup commands. This selects an existing connection;
+omit `--configure` for a custom name. Only that server's MCP tools are admitted.
+Use the same name after enrollment; changing it requires another verification.
+Other project connections and global client settings remain unchanged.
+
 Enrollment starts the actual client in a detached worktree. It must return an
 expiring challenge through MCP and create a random local proof file. The state
 records the client version and verified repository. Failed probes remain
@@ -217,8 +224,78 @@ update its final status. No credentials or message contents are stored in this
 status file. Authentication failures and lost task leases stop the watcher rather
 than bypassing authorization. Server retry delays are honored up to five minutes.
 
+On restart, the watcher recovers its structured lock only when the connection
+identity matches and the previous process is confirmed absent. It then resumes
+the saved cursor and pending observations. Live or inaccessible owners, older
+numeric locks, and interrupted acquisition guards remain untouched and require
+inspection. Add `--keep-alive` to explicitly start a small parent process that
+restarts a crashed watch child, at most three times with 1, 4 and 15 second delays.
+It retains the same connection, state directory and exact session arguments.
+Normal completion, hub Stop, authentication/configuration errors, lost leases and
+interrupts are terminal. Losing the parent stops its child. This parent never
+runs a model and does not survive a machine restart; without this option, lock
+recovery alone does not start the watcher for you after a crash.
+
+To observe an existing Codex or Claude Code session, add `--report --client
+codex|claude-code --session <UUID> --session-file <absolute-log-path> --cwd
+<absolute-repository-path> --state <absolute-private-directory>` to `watch`. Keep
+that same state directory when rotating a token: native queues are bound to the
+authenticated project and agent, so a replacement credential replays the same
+pending events. Reporting requires the server's `/api/agent/identity` endpoint;
+update the server first if the identity check is unavailable. The log must match that exact session and
+repository. The first read establishes a baseline; subsequent reads run every
+30 seconds and send changed session token totals to Runner activity. Prompts,
+code and tool arguments are excluded. When the server advertises native accounting,
+post-baseline token deltas also update Stats through `/api/usage/report`; pricing
+remains server-side. The first accepted automated reporter owns that native session.
+Other reporters receive a successful suppression acknowledgement without adding
+cost or blocking their worker. Reusing the state directory preserves the accounting
+window and pending retries. Older servers receive activity only. `--once --report`
+only establishes the baseline.
+Unsent observations stay in the local outbox on stop. Invalid logs pause reporting;
+authentication failures stop the watcher. Quiet logs never imply an agent signed off.
+Codex also reports the latest explicit turn start, completion or abort after the
+baseline read. A turn finishing does not mark the session offline. Claude turn
+lifecycle reporting is not yet supported; its token observations remain available.
+For either client, add `--session-pid <coding-client-pid>` to observe its actual
+process departure. The PID must be alive and the session log must verify at startup.
+A confirmed process exit reports Client disconnected and ends the watcher. The
+server marks the agent offline only while that runtime still owns its latest
+presence and no other runtime reported recently. Newer MCP work, ambiguous process
+access and missing lifecycle evidence retain normal presence expiry. PID reuse
+can delay departure detection; it never triggers a guessed disconnect.
+On supporting servers, native reporting discovers the agent's current active,
+owned task without extra flags. This is observational only: it neither claims
+work nor renews the discovered lease. With `--task <id> --lease <version>`, new turn activity includes the task only
+after a successful watch confirmation. Failed or stale confirmations drop that
+context. Session token totals stay unassigned; they span more than one task.
+Reporting status includes Claude's explicit branch and successful Edit/Write/MultiEdit
+filenames. Codex paginated logs can supply filenames through completed `FileChange`
+items; only their explicit absolute change-map paths are read, never diffs, commands
+or output. Both clients keep at most 50 repository-relative filenames (4 KiB total).
+Failed edits, unknown event formats and paths outside the repository are excluded.
+Changes after the baseline are queued for the website's Runner activity panel.
+This requires a server version supporting workspace observations; older servers
+reject the new event and pause reporting. Codex branch changes and files omitted
+from its structured log remain unknown; the watcher never guesses from a shared checkout.
+
+On supporting servers, Codex native subscription-limit events also update the
+agent's allowance meter. Claude reports its five-hour and seven-day allowance
+through the existing statusline relay when that client supplies `rate_limits`.
+Context-window percentages are never treated as subscription allowance. Missing
+or unsupported reports remain unknown; positive reports become stale after ten
+minutes. A confirmed limit remains until its reported reset, then becomes unknown
+until the next provider report. Only provider, window, remaining percentage,
+observation time and reset time are stored; no account identifier is required.
+
 An event-only watcher does **not** resume a desktop conversation. A connected
 watcher means events are being collected, not that an agent is currently coding.
+On supporting servers, `watch` marks its polls as passive: they refresh only the
+watcher timestamp, not the agent's session presence or last tool. Recent accepted
+native work observations refresh session presence; historical replay and waiting
+events do not. Legacy supervisors retain their existing presence behavior. This
+distinguishes a surviving watcher from an active session without treating a quiet
+log or a finished turn as logout.
 For unattended work, the operator must start a supported CLI worker or supervisor.
 
 The supervisor saves pending events before moving its cursor and checks stop,
@@ -284,6 +361,16 @@ with stdout into cumulative totals for a fresh billing invocation, so the final
 report does not charge interim tokens again. A successful fresh run can still
 use final stdout when no checkpoint becomes available. Other adapters report
 the structured usage their clients emit, often at turn completion.
+
+Worker and supervisor reports also retain `native_session: {client, id}` when
+Codex or Claude supplies a native session UUID. This correlation metadata does
+not replace the existing billing session or event ID, reset cumulative counters,
+or reset cumulative counters. On supporting servers, it identifies the shared
+accounting fence across native watchers, workers, supervisors and statusline reports.
+Fresh invocations never inherit an earlier session's identity when the current
+client has not reported one. Update every collector before using native accounting:
+old collectors and manual estimates without native identity cannot be correlated.
+Reports without a verified native UUID retain their existing accounting behavior.
 
 Readers check the exact session and workspace, file identity, append-only
 content, counter consistency and deadlines. Explicit native resume subtracts a
